@@ -48,10 +48,16 @@ if (existsSync(nsisScript) && existsSync(licenseRtf)) {
 
   // ─── Step 2: recompile NSIS installer ──────────────────────────────────────
 
-  const makensis = "C:\\Users\\Bittu\\AppData\\Local\\tauri\\NSIS\\makensis.exe";
-  if (existsSync(makensis)) {
+  const localAppData = process.env.LOCALAPPDATA
+    ?? join(process.env.USERPROFILE ?? 'C:\\Users\\runner', 'AppData', 'Local');
+  const makensis = [
+    join(localAppData, 'tauri', 'NSIS', 'makensis.exe'),
+    'C:\\Program Files (x86)\\NSIS\\makensis.exe',
+    'C:\\Program Files\\NSIS\\makensis.exe',
+  ].find(p => existsSync(p));
+  if (makensis) {
     console.log("  Recompiling NSIS installer with license page...");
-    execSync(`"${makensis}" "${nsisScript}"`, {
+    execSync(`"${makensis}" "${nsisScript}"`, {  // makensis must be quoted; path may contain spaces
       cwd: join(root, "src-tauri", "target", "release", "nsis", "x64"),
       stdio: "inherit",
     });
@@ -65,7 +71,7 @@ if (existsSync(nsisScript) && existsSync(licenseRtf)) {
       console.log("✓ Replaced bundle installer with license-patched version");
     }
   } else {
-    console.warn(`  makensis not found — skipping NSIS recompile`);
+    console.warn('  makensis not found — skipping NSIS recompile');
   }
 }
 

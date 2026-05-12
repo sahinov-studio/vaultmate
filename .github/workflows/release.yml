@@ -66,7 +66,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "VaultMate ${{ github.ref_name }}"
           releaseBody: |
-            See the [changelog](https://github.com/bittuai/vaultmate/blob/main/CHANGELOG.md) for what's new.
+            See the [changelog](https://github.com/sahinov-studio/vaultmate/blob/main/CHANGELOG.md) for what's new.
 
             ### Verifying downloads
 
@@ -77,3 +77,20 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: Patch Windows installer (inject license page)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: node scripts/copy-installer.mjs
+
+      - name: Re-upload patched Windows installer to release
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $files = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          foreach ($f in $files) {
+            Write-Host "Uploading $($f.Name) to release ${{ github.ref_name }}"
+            gh release upload "${{ github.ref_name }}" $f.FullName --clobber
+          }
