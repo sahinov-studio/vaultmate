@@ -1,0 +1,285 @@
+import { create } from "zustand";
+import { api } from "./lib/api";
+import { toast, asError } from "./lib/toast";
+import type {
+  AppSettings,
+  Credential,
+  CredentialWithProject,
+  CustomField,
+  Project,
+  VaultStatus,
+} from "./lib/types";
+
+type ViewMode = "projects" | "categories" | "favorites";
+type Theme = "light" | "dark";
+
+export interface CredentialInput {
+  title: string;
+  username: string;
+  secret: string;
+  url: string;
+  notes: string;
+  category: string;
+  tags: string[];
+  favorite: boolean;
+  totp_secret: string;
+  custom_fields: CustomField[];
+  expiry_date: string;
+}
+
+interface Store {
+  theme: Theme;
+  toggleTheme: () => void;
+
+  status: VaultStatus | null;
+  refreshStatus: () => Promise<void>;
+  setupMasterPassword: (password: string) => Promise<void>;
+  unlock: (password: string) => Promise<boolean>;
+  unlockWithPin: (pin: string) => Promise<boolean>;
+  migrate: (oldPin: string, newPassword: string) => Promise<void>;
+  lock: () => Promise<void>;
+
+  settings: AppSettings | null;
+  loadSettings: () => Promise<void>;
+  saveSettings: (
+    autoLockMinutes: number,
+    clipboardClearSeconds: number,
+    mcpEnabled: boolean,
+  ) => Promise<void>;
+
+  viewMode: ViewMode;
+  setViewMode: (mode: ViewMode) => void;
+  selectedCategory: string | null;
+  setSelectedCategory: (cat: string | null) => void;
+
+  projects: Project[];
+  activeProjectId: number | null;
+  loadProjects: () => Promise<void>;
+  createProject: (name: string, description: string, color: string) => Promise<Project>;
+  updateProject: (id: number, name: string, description: string, color: string) => Promise<void>;
+  deleteProject: (id: number) => Promise<void>;
+  setActiveProject: (id: number | null) => void;
+
+  credentials: Credential[];
+  loadCredentials: (projectId: number) => Promise<void>;
+  createCredential: (projectId: number, input: CredentialInput) => Promise<void>;
+  updateCredential: (id: number, input: CredentialInput) => Promise<void>;
+  deleteCredential: (id: number) => Promise<void>;
+  toggleFavorite: (id: number) => Promise<void>;
+  touchUsed: (id: number) => Promise<void>;
+
+  allCredentials: CredentialWithProject[];
+  loadAllCredentials: () => Promise<void>;
+
+  searchQuery: string;
+  searchResults: CredentialWithProject[];
+  search: (query: string) => Promise<void>;
+}
+
+function applyTheme(t: Theme) {
+  document.documentElement.classList.toggle("dark", t === "dark");
+}
+
+export const useStore = create<Store>((set, get) => ({
+  theme: (localStorage.getItem("vm-theme") as Theme) ?? "dark",
+
+  toggleTheme: () => {
+    const next = get().theme === "dark" ? "light" : "dark";
+    localStorage.setItem("vm-theme", next);
+    applyTheme(next);
+    set({ theme: next });
+  },
+
+  status: null,
+
+  refreshStatus: async () => {
+    try {
+      const status = await api.vaultStatus();
+      set({ status });
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  },
+
+  setupMasterPassword: async (password) => {
+    await api.setupMasterPassword(password);
+    await get().refreshStatus();
+    await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
+  },
+
+  unlock: async (password) => {
+    try {
+      await api.unlockVault(password);
+      await get().refreshStatus();
+      await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
+      return true;
+    } catch (e) {
+      toast.error(asError(e));
+      await get().refreshStatus();
+      return false;
+    }
+  },
+
+  unlockWithPin: async (pin) => {
+    try {
+      await api.unlockWithPin(pin);
+      await get().refreshStatus();
+      await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
+      return true;
+    } catch (e) {
+      toast.error(asError(e));
+      await get().refreshStatus();
+      return false;
+    }
+  },
+
+  migrate: async (oldPin, newPassword) => {
+    await api.migrateLegacyVault(oldPin, newPassword);
+    await get().refreshStatus();
+    await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
+    toast.success("Vault migrated successfully");
+  },
+
+  lock: async () => {
+    await api.lockVault();
+    set({
+      credentials: [],
+      allCredentials: [],
+      searchQuery: "",
+      searchResults: [],
+      activeProjectId: null,
+    });
+    await get().refreshStatus();
+  },
+
+  settings: null,
+  loadSettings: async () => {
+    try {
+      const settings = await api.getSettings();
+      set({ settings });
+    } catch (e) {
+      // Settings call doesn't require unlocked vault, but it's still fine to swallow.
+      console.warn("Failed to load settings:", e);
+    }
+  },
+  saveSettings: async (autoLockMinutes, clipboardClearSeconds, mcpEnabled) => {
+    await api.updateSettings(autoLockMinutes, clipboardClearSeconds, mcpEnabled);
+    await get().loadSettings();
+    toast.success("Settings saved");
+  },
+
+  viewMode: "projects",
+  setViewMode: (viewMode) => set({ viewMode, selectedCategory: null }),
+  selectedCategory: null,
+  setSelectedCategory: (selectedCategory) => set({ selectedCategory }),
+
+  projects: [],
+  activeProjectId: null,
+
+  loadProjects: async () => {
+    try {
+      const projects = await api.listProjects();
+      set({ projects });
+    } catch {
+      // Vault locked — not an error worth surfacing.
+    }
+  },
+
+  createProject: async (name, description, color) => {
+    const project = await api.createProject(name, description, color);
+    await get().loadProjects();
+    return project;
+  },
+
+  updateProject: async (id, name, description, color) => {
+    await api.updateProject(id, name, description, color);
+    await get().loadProjects();
+  },
+
+  deleteProject: async (id) => {
+    await api.deleteProject(id);
+    if (get().activeProjectId === id)
+      set({ activeProjectId: null, credentials: [] });
+    await Promise.all([get().loadProjects(), get().loadAllCredentials()]);
+  },
+
+  setActiveProject: (id) => {
+    set({
+      activeProjectId: id,
+      searchQuery: "",
+      searchResults: [],
+      selectedCategory: null,
+    });
+    if (id !== null) get().loadCredentials(id);
+  },
+
+  credentials: [],
+  loadCredentials: async (projectId) => {
+    try {
+      const credentials = await api.listCredentials(projectId);
+      set({ credentials });
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  },
+
+  createCredential: async (projectId, input) => {
+    await api.createCredential(projectId, input);
+    await Promise.all([get().loadCredentials(projectId), get().loadAllCredentials()]);
+  },
+
+  updateCredential: async (id, input) => {
+    await api.updateCredential(id, input);
+    const { activeProjectId } = get();
+    if (activeProjectId !== null) await get().loadCredentials(activeProjectId);
+    await get().loadAllCredentials();
+  },
+
+  deleteCredential: async (id) => {
+    await api.deleteCredential(id);
+    const { activeProjectId } = get();
+    if (activeProjectId !== null) await get().loadCredentials(activeProjectId);
+    await get().loadAllCredentials();
+  },
+
+  toggleFavorite: async (id) => {
+    await api.toggleFavorite(id);
+    const { activeProjectId } = get();
+    if (activeProjectId !== null) await get().loadCredentials(activeProjectId);
+    await get().loadAllCredentials();
+  },
+
+  touchUsed: async (id) => {
+    try {
+      await api.touchCredentialUsed(id);
+    } catch {
+      // Best-effort.
+    }
+  },
+
+  allCredentials: [],
+  loadAllCredentials: async () => {
+    try {
+      const allCredentials = await api.listAllCredentials();
+      set({ allCredentials });
+    } catch {
+      // Locked — fine.
+    }
+  },
+
+  searchQuery: "",
+  searchResults: [],
+  search: async (query) => {
+    set({ searchQuery: query });
+    if (!query.trim()) {
+      set({ searchResults: [] });
+      return;
+    }
+    try {
+      const searchResults = await api.searchCredentials(query);
+      set({ searchResults });
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  },
+}));
