@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -180,7 +182,7 @@ fn clear_failed_attempts(conn: &rusqlite::Connection) {
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn vault_status(state: State<'_, VaultState>) -> Result<VaultStatus, String> {
+pub fn vault_status(state: State<'_, Arc<VaultState>>) -> Result<VaultStatus, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     let initialized = db::get_setting(&conn, "vault_key_blob").is_some();
     let legacy = db::has_legacy_vault(&conn) || db::get_setting(&conn, "pin_hash").is_some();
@@ -206,7 +208,7 @@ pub fn vault_status(state: State<'_, VaultState>) -> Result<VaultStatus, String>
 #[tauri::command]
 pub fn setup_master_password(
     password: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<(), String> {
     if password.len() < 8 {
         return Err("Master password must be at least 8 characters".to_string());
@@ -230,7 +232,7 @@ pub fn setup_master_password(
 }
 
 #[tauri::command]
-pub fn unlock_vault(password: String, state: State<'_, VaultState>) -> Result<(), String> {
+pub fn unlock_vault(password: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     rate_limit_check(&conn)?;
     let salt_hex = db::get_setting(&conn, "master_salt").ok_or("Vault is not initialized")?;
@@ -255,7 +257,7 @@ pub fn unlock_vault(password: String, state: State<'_, VaultState>) -> Result<()
 }
 
 #[tauri::command]
-pub fn unlock_with_pin(pin: String, state: State<'_, VaultState>) -> Result<(), String> {
+pub fn unlock_with_pin(pin: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     rate_limit_check(&conn)?;
     let salt_hex = db::get_setting(&conn, "quick_pin_salt").ok_or("Quick PIN is not set")?;
@@ -280,13 +282,13 @@ pub fn unlock_with_pin(pin: String, state: State<'_, VaultState>) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn lock_vault(state: State<'_, VaultState>) -> Result<(), String> {
+pub fn lock_vault(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     state.lock();
     Ok(())
 }
 
 #[tauri::command]
-pub fn touch_activity(state: State<'_, VaultState>) -> Result<i64, String> {
+pub fn touch_activity(state: State<'_, Arc<VaultState>>) -> Result<i64, String> {
     if !state.is_unlocked() {
         return Ok(-1);
     }
@@ -295,14 +297,14 @@ pub fn touch_activity(state: State<'_, VaultState>) -> Result<i64, String> {
 }
 
 #[tauri::command]
-pub fn idle_seconds(state: State<'_, VaultState>) -> Result<i64, String> {
+pub fn idle_seconds(state: State<'_, Arc<VaultState>>) -> Result<i64, String> {
     Ok(state.idle_for().as_secs() as i64)
 }
 
 // ── Quick PIN management ──────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn enable_quick_pin(pin: String, state: State<'_, VaultState>) -> Result<(), String> {
+pub fn enable_quick_pin(pin: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     if pin.len() < 4 {
         return Err("PIN must be at least 4 digits".to_string());
     }
@@ -331,7 +333,7 @@ pub fn disable_quick_pin() -> Result<(), String> {
 pub fn change_master_password(
     current: String,
     new_password: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<(), String> {
     if new_password.len() < 8 {
         return Err("New password must be at least 8 characters".to_string());
@@ -369,7 +371,7 @@ pub fn change_master_password(
 pub fn migrate_legacy_vault(
     old_pin: String,
     new_password: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<(), String> {
     if new_password.len() < 8 {
         return Err("New master password must be at least 8 characters".to_string());
@@ -518,7 +520,7 @@ pub fn rotate_mcp_token() -> Result<String, String> {
 // ── Projects ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn list_projects(state: State<'_, VaultState>) -> Result<Vec<Project>, String> {
+pub fn list_projects(state: State<'_, Arc<VaultState>>) -> Result<Vec<Project>, String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
     }
@@ -548,7 +550,7 @@ pub fn create_project(
     name: String,
     description: String,
     color: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Project, String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
@@ -583,7 +585,7 @@ pub fn update_project(
     name: String,
     description: String,
     color: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Project, String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
@@ -612,7 +614,7 @@ pub fn update_project(
 }
 
 #[tauri::command]
-pub fn delete_project(id: i64, state: State<'_, VaultState>) -> Result<(), String> {
+pub fn delete_project(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
     }
@@ -628,7 +630,7 @@ pub fn delete_project(id: i64, state: State<'_, VaultState>) -> Result<(), Strin
 #[tauri::command]
 pub fn list_credentials(
     project_id: i64,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Vec<Credential>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     state.with_key(|vk| -> Result<Vec<Credential>, String> {
@@ -662,7 +664,7 @@ pub fn create_credential(
     totp_secret: String,
     custom_fields: Vec<CustomField>,
     expiry_date: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Credential, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     state.with_key(|vk| -> Result<Credential, String> {
@@ -722,7 +724,7 @@ pub fn update_credential(
     totp_secret: String,
     custom_fields: Vec<CustomField>,
     expiry_date: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Credential, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     state.with_key(|vk| -> Result<Credential, String> {
@@ -768,7 +770,7 @@ pub fn update_credential(
 }
 
 #[tauri::command]
-pub fn delete_credential(id: i64, state: State<'_, VaultState>) -> Result<(), String> {
+pub fn delete_credential(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
     }
@@ -780,7 +782,7 @@ pub fn delete_credential(id: i64, state: State<'_, VaultState>) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn touch_credential_used(id: i64, state: State<'_, VaultState>) -> Result<(), String> {
+pub fn touch_credential_used(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
     }
@@ -794,7 +796,7 @@ pub fn touch_credential_used(id: i64, state: State<'_, VaultState>) -> Result<()
 }
 
 #[tauri::command]
-pub fn toggle_favorite(id: i64, state: State<'_, VaultState>) -> Result<bool, String> {
+pub fn toggle_favorite(id: i64, state: State<'_, Arc<VaultState>>) -> Result<bool, String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
     }
@@ -817,7 +819,7 @@ pub fn toggle_favorite(id: i64, state: State<'_, VaultState>) -> Result<bool, St
 
 #[tauri::command]
 pub fn list_all_credentials(
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Vec<CredentialWithProject>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     state.with_key(|vk| -> Result<Vec<CredentialWithProject>, String> {
@@ -859,7 +861,7 @@ pub fn list_all_credentials(
 #[tauri::command]
 pub fn search_credentials(
     query: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<Vec<CredentialWithProject>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     let pattern = format!("%{}%", query);
@@ -926,7 +928,7 @@ pub struct TotpResult {
 #[tauri::command]
 pub fn totp_for_credential(
     credential_id: i64,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<TotpResult, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     state.with_key(|vk| -> Result<TotpResult, String> {
@@ -1028,7 +1030,7 @@ struct BackupFile {
 #[tauri::command]
 pub fn export_backup(
     password: String,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<String, String> {
     if password.len() < 8 {
         return Err("Backup password must be at least 8 characters".to_string());
@@ -1084,7 +1086,7 @@ pub fn import_backup(
     backup_json: String,
     password: String,
     replace_existing: bool,
-    state: State<'_, VaultState>,
+    state: State<'_, Arc<VaultState>>,
 ) -> Result<i64, String> {
     let file: BackupFile =
         serde_json::from_str(&backup_json).map_err(|_| "Invalid backup file".to_string())?;
@@ -1193,7 +1195,7 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 // ── Bulk data management ──────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn delete_all_data(state: State<'_, VaultState>) -> Result<(), String> {
+pub fn delete_all_data(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     if !state.is_unlocked() {
         return Err("Vault is locked".to_string());
     }
