@@ -103,6 +103,13 @@ const CRED_COLS: &str = "id, project_id, title, username, secret_blob, url, note
                          tags, favorite, totp_blob, custom_blob, expiry_date, last_used_at, \
                          created_at, updated_at";
 
+// Identical columns but with the `c.` table qualifier — required in JOIN queries where
+// both `credentials c` and `projects p` share column names (`id`, `created_at`).
+const CRED_COLS_JOIN: &str =
+    "c.id, c.project_id, c.title, c.username, c.secret_blob, c.url, c.notes_blob, c.category, \
+     c.tags, c.favorite, c.totp_blob, c.custom_blob, c.expiry_date, c.last_used_at, \
+     c.created_at, c.updated_at";
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn row_to_credential(
@@ -825,7 +832,7 @@ pub fn list_all_credentials(
     state.with_key(|vk| -> Result<Vec<CredentialWithProject>, String> {
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {CRED_COLS}, p.name as project_name FROM credentials c \
+                "SELECT {CRED_COLS_JOIN}, p.name as project_name FROM credentials c \
                  JOIN projects p ON c.project_id=p.id ORDER BY p.name, c.title"
             ))
             .map_err(|e| e.to_string())?;
@@ -870,7 +877,7 @@ pub fn search_credentials(
         // plus a post-decrypt scan over notes/secret/custom fields.
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {CRED_COLS}, p.name as project_name FROM credentials c \
+                "SELECT {CRED_COLS_JOIN}, p.name as project_name FROM credentials c \
                  JOIN projects p ON c.project_id=p.id ORDER BY p.name, c.title"
             ))
             .map_err(|e| e.to_string())?;

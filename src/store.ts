@@ -169,7 +169,14 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   viewMode: "projects",
-  setViewMode: (viewMode) => set({ viewMode, selectedCategory: null }),
+  setViewMode: (viewMode) =>
+    set({
+      viewMode,
+      selectedCategory: null,
+      // Clear the active project when leaving the projects view so "Add Credential"
+      // doesn't appear in favorites/categories and credentials don't reload stale.
+      ...(viewMode !== "projects" ? { activeProjectId: null, credentials: [] } : {}),
+    }),
   selectedCategory: null,
   setSelectedCategory: (selectedCategory) => set({ selectedCategory }),
 
@@ -243,10 +250,20 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   toggleFavorite: async (id) => {
-    await api.toggleFavorite(id);
-    const { activeProjectId } = get();
-    if (activeProjectId !== null) await get().loadCredentials(activeProjectId);
-    await get().loadAllCredentials();
+    const flip = <T extends { id: number; favorite: boolean }>(list: T[]): T[] =>
+      list.map((c) => (c.id === id ? { ...c, favorite: !c.favorite } : c));
+    // Optimistic update — flip immediately so favorites view responds instantly.
+    set((s) => ({ credentials: flip(s.credentials), allCredentials: flip(s.allCredentials) }));
+    try {
+      await api.toggleFavorite(id);
+      const { activeProjectId } = get();
+      if (activeProjectId !== null) await get().loadCredentials(activeProjectId);
+      await get().loadAllCredentials();
+    } catch (e) {
+      // Rollback optimistic update on failure.
+      set((s) => ({ credentials: flip(s.credentials), allCredentials: flip(s.allCredentials) }));
+      toast.error(asError(e));
+    }
   },
 
   touchUsed: async (id) => {
