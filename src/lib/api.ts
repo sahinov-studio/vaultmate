@@ -68,9 +68,35 @@ export const api = {
   listCredentials: (projectId: number) =>
     invoke<Credential[]>("list_credentials", { projectId }),
   createCredential: (projectId: number, payload: CredentialPayload) =>
-    invoke<Credential>("create_credential", { projectId, ...payload }),
+    invoke<Credential>("create_credential", {
+      projectId,
+      title: payload.title,
+      username: payload.username,
+      secret: payload.secret,
+      url: payload.url,
+      notes: payload.notes,
+      category: payload.category,
+      tags: payload.tags,
+      favorite: payload.favorite,
+      totpSecret: payload.totp_secret,
+      customFields: payload.custom_fields,
+      expiryDate: payload.expiry_date,
+    }),
   updateCredential: (id: number, payload: CredentialPayload) =>
-    invoke<Credential>("update_credential", { id, ...payload }),
+    invoke<Credential>("update_credential", {
+      id,
+      title: payload.title,
+      username: payload.username,
+      secret: payload.secret,
+      url: payload.url,
+      notes: payload.notes,
+      category: payload.category,
+      tags: payload.tags,
+      favorite: payload.favorite,
+      totpSecret: payload.totp_secret,
+      customFields: payload.custom_fields,
+      expiryDate: payload.expiry_date,
+    }),
   deleteCredential: (id: number) => invoke<void>("delete_credential", { id }),
   toggleFavorite: (id: number) => invoke<boolean>("toggle_favorite", { id }),
   touchCredentialUsed: (id: number) =>
