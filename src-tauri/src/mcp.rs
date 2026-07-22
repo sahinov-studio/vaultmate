@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::crypto::decrypt_string;
+use crate::crypto::{decrypt_string, encrypt_string};
 use crate::db;
 use crate::state::VaultState;
 
@@ -286,6 +286,93 @@ fn tool_list() -> Value {
                 },
                 "required": ["query"]
             }
+        },
+        {
+            "name": "create_project",
+            "description": "Create a new project in VaultMate. No-op with a friendly message if a project with this name already exists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Project name" },
+                    "description": { "type": "string", "description": "Optional short description" },
+                    "color": { "type": "string", "description": "Optional color, e.g. 'indigo', 'blue', 'green' (default: indigo)" }
+                },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "update_project",
+            "description": "Update a project's name, description, or color. Only fields provided are changed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Current project name" },
+                    "new_name": { "type": "string", "description": "New project name (optional)" },
+                    "description": { "type": "string", "description": "New description (optional)" },
+                    "color": { "type": "string", "description": "New color (optional)" }
+                },
+                "required": ["project_name"]
+            }
+        },
+        {
+            "name": "delete_project",
+            "description": "Delete a project and all of its credentials. This cannot be undone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Project name to delete" }
+                },
+                "required": ["project_name"]
+            }
+        },
+        {
+            "name": "create_credential",
+            "description": "Create a new credential under a project. The project is created automatically if it doesn't already exist.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Project name (created if missing)" },
+                    "title": { "type": "string", "description": "Credential title" },
+                    "secret": { "type": "string", "description": "The secret value (password, API key, token, etc.)" },
+                    "username": { "type": "string", "description": "Optional username/email" },
+                    "url": { "type": "string", "description": "Optional URL" },
+                    "notes": { "type": "string", "description": "Optional notes" },
+                    "category": { "type": "string", "description": "Optional category (default: other)" },
+                    "favorite": { "type": "boolean", "description": "Optional favorite flag (default: false)" }
+                },
+                "required": ["project_name", "title", "secret"]
+            }
+        },
+        {
+            "name": "update_credential",
+            "description": "Update an existing credential, found by project name + title. Only fields provided are changed — omitted fields keep their current value.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Project name" },
+                    "title": { "type": "string", "description": "Credential title to find" },
+                    "new_title": { "type": "string", "description": "New title (optional)" },
+                    "secret": { "type": "string", "description": "New secret value (optional)" },
+                    "username": { "type": "string", "description": "New username (optional)" },
+                    "url": { "type": "string", "description": "New URL (optional)" },
+                    "notes": { "type": "string", "description": "New notes (optional)" },
+                    "category": { "type": "string", "description": "New category (optional)" },
+                    "favorite": { "type": "boolean", "description": "New favorite flag (optional)" }
+                },
+                "required": ["project_name", "title"]
+            }
+        },
+        {
+            "name": "delete_credential",
+            "description": "Delete a credential, found by project name + title. This cannot be undone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_name": { "type": "string", "description": "Project name" },
+                    "title": { "type": "string", "description": "Credential title to delete" }
+                },
+                "required": ["project_name", "title"]
+            }
         }
     ])
 }
@@ -423,6 +510,272 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                     format!("Search results for '{query}':\n\n{}", rows.join("\n\n"))
                 })
             })?
+        }
+
+        "create_project" => {
+            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return Err("'name' is required".to_string());
+            }
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM projects WHERE name=?1",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .ok();
+            if existing.is_some() {
+                return Ok(format!("Project '{name}' already exists — nothing changed."));
+            }
+            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let color = args
+                .get("color")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("indigo");
+            conn.execute(
+                "INSERT INTO projects (name, description, color) VALUES (?1, ?2, ?3)",
+                rusqlite::params![name, description, color],
+            )
+            .map_err(|e| e.to_string())?;
+            state.touch();
+            Ok(format!("Created project '{name}'."))
+        }
+
+        "update_project" => {
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let (id, cur_name, cur_desc, cur_color): (i64, String, String, String) = conn
+                .query_row(
+                    "SELECT id, name, description, color FROM projects WHERE name=?1",
+                    rusqlite::params![project_name],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2).unwrap_or_default(),
+                            row.get(3).unwrap_or_else(|_| "indigo".to_string()),
+                        ))
+                    },
+                )
+                .map_err(|_| format!("Project '{project_name}' not found."))?;
+            let new_name = args
+                .get("new_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&cur_name);
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&cur_desc);
+            let color = args
+                .get("color")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&cur_color);
+            conn.execute(
+                "UPDATE projects SET name=?1, description=?2, color=?3 WHERE id=?4",
+                rusqlite::params![new_name, description, color, id],
+            )
+            .map_err(|e| e.to_string())?;
+            state.touch();
+            Ok(format!("Updated project '{project_name}' -> '{new_name}'."))
+        }
+
+        "delete_project" => {
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let changed = conn
+                .execute(
+                    "DELETE FROM projects WHERE name=?1",
+                    rusqlite::params![project_name],
+                )
+                .map_err(|e| e.to_string())?;
+            state.touch();
+            if changed == 0 {
+                Ok(format!("Project '{project_name}' not found — nothing deleted."))
+            } else {
+                Ok(format!("Deleted project '{project_name}' and its credentials."))
+            }
+        }
+
+        "create_credential" => {
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let secret = args.get("secret").and_then(|v| v.as_str()).unwrap_or("");
+            if project_name.is_empty() || title.is_empty() {
+                return Err("'project_name' and 'title' are required".to_string());
+            }
+            let project_id: i64 = match conn.query_row(
+                "SELECT id FROM projects WHERE name=?1",
+                rusqlite::params![project_name],
+                |row| row.get(0),
+            ) {
+                Ok(id) => id,
+                Err(_) => {
+                    conn.execute(
+                        "INSERT INTO projects (name, description, color) VALUES (?1, '', 'indigo')",
+                        rusqlite::params![project_name],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    conn.last_insert_rowid()
+                }
+            };
+            let username = args.get("username").and_then(|v| v.as_str()).unwrap_or("");
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let notes = args.get("notes").and_then(|v| v.as_str()).unwrap_or("");
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("other");
+            let favorite = args.get("favorite").and_then(|v| v.as_bool()).unwrap_or(false);
+            state.with_key(|vk| {
+                let secret_blob = encrypt_string(vk.as_bytes(), secret)?;
+                let notes_blob = encrypt_string(vk.as_bytes(), notes)?;
+                conn.execute(
+                    "INSERT INTO credentials (project_id, title, username, secret_blob, url, \
+                                              notes_blob, category, tags, favorite, totp_blob, \
+                                              custom_blob, expiry_date) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,'[]',?8,'','','')",
+                    rusqlite::params![
+                        project_id,
+                        title,
+                        username,
+                        secret_blob,
+                        url,
+                        notes_blob,
+                        category,
+                        if favorite { 1 } else { 0 },
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok::<String, String>(format!(
+                    "Created credential '{title}' in project '{project_name}'."
+                ))
+            })?
+            .map(|msg| {
+                state.touch();
+                msg
+            })
+        }
+
+        "update_credential" => {
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            state.with_key(|vk| {
+                let (id, cur_username, cur_secret_blob, cur_url, cur_notes_blob, cur_category, cur_favorite): (
+                    i64, String, String, String, String, String, i64,
+                ) = conn
+                    .query_row(
+                        "SELECT c.id, c.username, c.secret_blob, c.url, c.notes_blob, c.category, c.favorite \
+                         FROM credentials c JOIN projects p ON c.project_id=p.id \
+                         WHERE p.name=?1 AND c.title=?2",
+                        rusqlite::params![project_name, title],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1).unwrap_or_default(),
+                                row.get(2).unwrap_or_default(),
+                                row.get(3).unwrap_or_default(),
+                                row.get(4).unwrap_or_default(),
+                                row.get(5).unwrap_or_else(|_| "other".to_string()),
+                                row.get(6).unwrap_or(0),
+                            ))
+                        },
+                    )
+                    .map_err(|_| {
+                        format!("Credential '{title}' not found in project '{project_name}'.")
+                    })?;
+
+                let new_title = args
+                    .get("new_title")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(title);
+                let username = args.get("username").and_then(|v| v.as_str()).unwrap_or(&cur_username);
+                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or(&cur_url);
+                let category = args
+                    .get("category")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&cur_category);
+                let favorite = args
+                    .get("favorite")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(cur_favorite != 0);
+
+                // Secret/notes stay encrypted at rest — only re-encrypt if a new
+                // plaintext value was actually provided; otherwise keep the
+                // existing ciphertext blob untouched.
+                let secret_blob = match args.get("secret").and_then(|v| v.as_str()) {
+                    Some(s) => encrypt_string(vk.as_bytes(), s)?,
+                    None => cur_secret_blob,
+                };
+                let notes_blob = match args.get("notes").and_then(|v| v.as_str()) {
+                    Some(s) => encrypt_string(vk.as_bytes(), s)?,
+                    None => cur_notes_blob,
+                };
+
+                conn.execute(
+                    "UPDATE credentials SET title=?1, username=?2, secret_blob=?3, url=?4, \
+                                            notes_blob=?5, category=?6, favorite=?7, \
+                                            updated_at=datetime('now') WHERE id=?8",
+                    rusqlite::params![
+                        new_title,
+                        username,
+                        secret_blob,
+                        url,
+                        notes_blob,
+                        category,
+                        if favorite { 1 } else { 0 },
+                        id,
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok::<String, String>(format!(
+                    "Updated credential '{title}' in project '{project_name}'."
+                ))
+            })?
+            .map(|msg| {
+                state.touch();
+                msg
+            })
+        }
+
+        "delete_credential" => {
+            let project_name = args
+                .get("project_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let changed = conn
+                .execute(
+                    "DELETE FROM credentials WHERE title=?2 AND project_id = \
+                     (SELECT id FROM projects WHERE name=?1)",
+                    rusqlite::params![project_name, title],
+                )
+                .map_err(|e| e.to_string())?;
+            state.touch();
+            if changed == 0 {
+                Ok(format!(
+                    "Credential '{title}' not found in project '{project_name}' — nothing deleted."
+                ))
+            } else {
+                Ok(format!(
+                    "Deleted credential '{title}' from project '{project_name}'."
+                ))
+            }
         }
 
         _ => Err(format!("Unknown tool: {name}")),
