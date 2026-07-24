@@ -6,7 +6,6 @@ use std::sync::{Arc, OnceLock};
 use serde_json::Value;
 use tauri::Emitter;
 
-use crate::crypto::{decrypt_string, encrypt_string};
 use crate::db;
 use crate::state::VaultState;
 
@@ -100,11 +99,11 @@ fn handle_connection(stream: &mut TcpStream, state: Arc<VaultState>) {
         return;
     }
 
-    if !state.is_unlocked() {
+    if db::needs_migration(&conn) {
         send_status(
             stream,
             423,
-            r#"{"error":"Vault is locked. Unlock VaultMate to use MCP."}"#,
+            r#"{"error":"Vault needs a one-time migration — open VaultMate to finish it."}"#,
         );
         return;
     }
@@ -405,11 +404,6 @@ fn tool_list() -> Value {
                 },
                 "required": ["project_name", "title"]
             }
-        },
-        {
-            "name": "enable_auto_unlock",
-            "description": "One-time migration for a vault that still has an explicit master password: wraps the already-unlocked session's key with Windows DPAPI so the vault never needs a password again, on any future launch. No-op if already enabled. Takes no arguments — reaching this tool at all already proves the vault is unlocked.",
-            "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }
     ])
 }
@@ -448,36 +442,33 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                 .get("project_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            state.with_key(|vk| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT c.title, c.username, c.secret_blob, c.url, c.category \
-                         FROM credentials c JOIN projects p ON c.project_id=p.id \
-                         WHERE p.name=?1 ORDER BY c.title",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows: Vec<String> = stmt
-                    .query_map(rusqlite::params![project_name], |row| {
-                        let title: String = row.get(0)?;
-                        let user: String = row.get(1).unwrap_or_default();
-                        let secret_blob: String = row.get(2).unwrap_or_default();
-                        let url: String = row.get(3).unwrap_or_default();
-                        let cat: String = row.get(4).unwrap_or_default();
-                        let secret =
-                            decrypt_string(vk.as_bytes(), &secret_blob).unwrap_or_default();
-                        Ok(format!(
-                            "[{cat}] {title}\n  username: {user}\n  secret: {secret}\n  url: {url}"
-                        ))
-                    })
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                Ok::<String, String>(if rows.is_empty() {
-                    format!("No credentials found for project '{project_name}'.")
-                } else {
-                    format!("Credentials for '{project_name}':\n\n{}", rows.join("\n\n"))
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.title, c.username, c.secret, c.url, c.category \
+                     FROM credentials c JOIN projects p ON c.project_id=p.id \
+                     WHERE p.name=?1 ORDER BY c.title",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<String> = stmt
+                .query_map(rusqlite::params![project_name], |row| {
+                    let title: String = row.get(0)?;
+                    let user: String = row.get(1).unwrap_or_default();
+                    let secret: String = row.get(2).unwrap_or_default();
+                    let url: String = row.get(3).unwrap_or_default();
+                    let cat: String = row.get(4).unwrap_or_default();
+                    Ok(format!(
+                        "[{cat}] {title}\n  username: {user}\n  secret: {secret}\n  url: {url}"
+                    ))
                 })
-            })?
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            state.touch();
+            Ok(if rows.is_empty() {
+                format!("No credentials found for project '{project_name}'.")
+            } else {
+                format!("Credentials for '{project_name}':\n\n{}", rows.join("\n\n"))
+            })
         }
 
         "get_credential" => {
@@ -486,67 +477,61 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            state.with_key(|vk| {
-                let result = conn.query_row(
-                    "SELECT c.title, c.username, c.secret_blob, c.url, c.notes_blob, c.category \
-                     FROM credentials c JOIN projects p ON c.project_id=p.id \
-                     WHERE p.name=?1 AND c.title=?2",
-                    rusqlite::params![project_name, title],
-                    |row| {
-                        let t: String = row.get(0)?;
-                        let u: String = row.get(1).unwrap_or_default();
-                        let sb: String = row.get(2).unwrap_or_default();
-                        let url: String = row.get(3).unwrap_or_default();
-                        let nb: String = row.get(4).unwrap_or_default();
-                        let cat: String = row.get(5).unwrap_or_default();
-                        let secret = decrypt_string(vk.as_bytes(), &sb).unwrap_or_default();
-                        let notes = decrypt_string(vk.as_bytes(), &nb).unwrap_or_default();
-                        Ok(format!(
-                            "Title: {t}\nCategory: {cat}\nUsername: {u}\nSecret: {secret}\nURL: {url}\nNotes: {notes}"
-                        ))
-                    },
-                );
-                Ok::<String, String>(result.unwrap_or_else(|_| {
-                    format!("Credential '{title}' not found in project '{project_name}'.")
-                }))
-            })?
+            let result = conn.query_row(
+                "SELECT c.title, c.username, c.secret, c.url, c.notes, c.category \
+                 FROM credentials c JOIN projects p ON c.project_id=p.id \
+                 WHERE p.name=?1 AND c.title=?2",
+                rusqlite::params![project_name, title],
+                |row| {
+                    let t: String = row.get(0)?;
+                    let u: String = row.get(1).unwrap_or_default();
+                    let secret: String = row.get(2).unwrap_or_default();
+                    let url: String = row.get(3).unwrap_or_default();
+                    let notes: String = row.get(4).unwrap_or_default();
+                    let cat: String = row.get(5).unwrap_or_default();
+                    Ok(format!(
+                        "Title: {t}\nCategory: {cat}\nUsername: {u}\nSecret: {secret}\nURL: {url}\nNotes: {notes}"
+                    ))
+                },
+            );
+            state.touch();
+            Ok(result.unwrap_or_else(|_| {
+                format!("Credential '{title}' not found in project '{project_name}'.")
+            }))
         }
 
         "search_credentials" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let pattern = format!("%{query}%");
-            state.with_key(|vk| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT p.name, c.title, c.username, c.secret_blob, c.url, c.category \
-                         FROM credentials c JOIN projects p ON c.project_id=p.id \
-                         WHERE c.title LIKE ?1 OR c.username LIKE ?1 OR c.url LIKE ?1 \
-                         ORDER BY p.name, c.title",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows: Vec<String> = stmt
-                    .query_map(rusqlite::params![pattern], |row| {
-                        let proj: String = row.get(0)?;
-                        let title: String = row.get(1)?;
-                        let user: String = row.get(2).unwrap_or_default();
-                        let sb: String = row.get(3).unwrap_or_default();
-                        let url: String = row.get(4).unwrap_or_default();
-                        let cat: String = row.get(5).unwrap_or_default();
-                        let secret =
-                            decrypt_string(vk.as_bytes(), &sb).unwrap_or_default();
-                        Ok(format!(
-                            "[{cat}] {proj} / {title}\n  username: {user}\n  secret: {secret}\n  url: {url}"
-                        ))
-                    })
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                Ok::<String, String>(if rows.is_empty() {
-                    format!("No credentials found matching '{query}'.")
-                } else {
-                    format!("Search results for '{query}':\n\n{}", rows.join("\n\n"))
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.name, c.title, c.username, c.secret, c.url, c.category \
+                     FROM credentials c JOIN projects p ON c.project_id=p.id \
+                     WHERE c.title LIKE ?1 OR c.username LIKE ?1 OR c.url LIKE ?1 \
+                     ORDER BY p.name, c.title",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<String> = stmt
+                .query_map(rusqlite::params![pattern], |row| {
+                    let proj: String = row.get(0)?;
+                    let title: String = row.get(1)?;
+                    let user: String = row.get(2).unwrap_or_default();
+                    let secret: String = row.get(3).unwrap_or_default();
+                    let url: String = row.get(4).unwrap_or_default();
+                    let cat: String = row.get(5).unwrap_or_default();
+                    Ok(format!(
+                        "[{cat}] {proj} / {title}\n  username: {user}\n  secret: {secret}\n  url: {url}"
+                    ))
                 })
-            })?
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            state.touch();
+            Ok(if rows.is_empty() {
+                format!("No credentials found matching '{query}'.")
+            } else {
+                format!("Search results for '{query}':\n\n{}", rows.join("\n\n"))
+            })
         }
 
         "create_project" => {
@@ -674,34 +659,27 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                 .filter(|s| !s.is_empty())
                 .unwrap_or("other");
             let favorite = args.get("favorite").and_then(|v| v.as_bool()).unwrap_or(false);
-            state.with_key(|vk| {
-                let secret_blob = encrypt_string(vk.as_bytes(), secret)?;
-                let notes_blob = encrypt_string(vk.as_bytes(), notes)?;
-                conn.execute(
-                    "INSERT INTO credentials (project_id, title, username, secret_blob, url, \
-                                              notes_blob, category, tags, favorite, totp_blob, \
-                                              custom_blob, expiry_date) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,'[]',?8,'','','')",
-                    rusqlite::params![
-                        project_id,
-                        title,
-                        username,
-                        secret_blob,
-                        url,
-                        notes_blob,
-                        category,
-                        if favorite { 1 } else { 0 },
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-                Ok::<String, String>(format!(
-                    "Created credential '{title}' in project '{project_name}'."
-                ))
-            })?
-            .map(|msg| {
-                state.touch();
-                msg
-            })
+            conn.execute(
+                "INSERT INTO credentials (project_id, title, username, secret, url, \
+                                          notes, category, tags, favorite, totp_secret, \
+                                          custom_fields, expiry_date) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'[]',?8,'','','')",
+                rusqlite::params![
+                    project_id,
+                    title,
+                    username,
+                    secret,
+                    url,
+                    notes,
+                    category,
+                    if favorite { 1 } else { 0 },
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            state.touch();
+            Ok(format!(
+                "Created credential '{title}' in project '{project_name}'."
+            ))
         }
 
         "update_credential" => {
@@ -710,84 +688,69 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            state.with_key(|vk| {
-                let (id, cur_username, cur_secret_blob, cur_url, cur_notes_blob, cur_category, cur_favorite): (
-                    i64, String, String, String, String, String, i64,
-                ) = conn
-                    .query_row(
-                        "SELECT c.id, c.username, c.secret_blob, c.url, c.notes_blob, c.category, c.favorite \
-                         FROM credentials c JOIN projects p ON c.project_id=p.id \
-                         WHERE p.name=?1 AND c.title=?2",
-                        rusqlite::params![project_name, title],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1).unwrap_or_default(),
-                                row.get(2).unwrap_or_default(),
-                                row.get(3).unwrap_or_default(),
-                                row.get(4).unwrap_or_default(),
-                                row.get(5).unwrap_or_else(|_| "other".to_string()),
-                                row.get(6).unwrap_or(0),
-                            ))
-                        },
-                    )
-                    .map_err(|_| {
-                        format!("Credential '{title}' not found in project '{project_name}'.")
-                    })?;
-
-                let new_title = args
-                    .get("new_title")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(title);
-                let username = args.get("username").and_then(|v| v.as_str()).unwrap_or(&cur_username);
-                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or(&cur_url);
-                let category = args
-                    .get("category")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&cur_category);
-                let favorite = args
-                    .get("favorite")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(cur_favorite != 0);
-
-                // Secret/notes stay encrypted at rest — only re-encrypt if a new
-                // plaintext value was actually provided; otherwise keep the
-                // existing ciphertext blob untouched.
-                let secret_blob = match args.get("secret").and_then(|v| v.as_str()) {
-                    Some(s) => encrypt_string(vk.as_bytes(), s)?,
-                    None => cur_secret_blob,
-                };
-                let notes_blob = match args.get("notes").and_then(|v| v.as_str()) {
-                    Some(s) => encrypt_string(vk.as_bytes(), s)?,
-                    None => cur_notes_blob,
-                };
-
-                conn.execute(
-                    "UPDATE credentials SET title=?1, username=?2, secret_blob=?3, url=?4, \
-                                            notes_blob=?5, category=?6, favorite=?7, \
-                                            updated_at=datetime('now') WHERE id=?8",
-                    rusqlite::params![
-                        new_title,
-                        username,
-                        secret_blob,
-                        url,
-                        notes_blob,
-                        category,
-                        if favorite { 1 } else { 0 },
-                        id,
-                    ],
+            let (id, cur_username, cur_secret, cur_url, cur_notes, cur_category, cur_favorite): (
+                i64, String, String, String, String, String, i64,
+            ) = conn
+                .query_row(
+                    "SELECT c.id, c.username, c.secret, c.url, c.notes, c.category, c.favorite \
+                     FROM credentials c JOIN projects p ON c.project_id=p.id \
+                     WHERE p.name=?1 AND c.title=?2",
+                    rusqlite::params![project_name, title],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1).unwrap_or_default(),
+                            row.get(2).unwrap_or_default(),
+                            row.get(3).unwrap_or_default(),
+                            row.get(4).unwrap_or_default(),
+                            row.get(5).unwrap_or_else(|_| "other".to_string()),
+                            row.get(6).unwrap_or(0),
+                        ))
+                    },
                 )
-                .map_err(|e| e.to_string())?;
-                Ok::<String, String>(format!(
-                    "Updated credential '{title}' in project '{project_name}'."
-                ))
-            })?
-            .map(|msg| {
-                state.touch();
-                msg
-            })
+                .map_err(|_| {
+                    format!("Credential '{title}' not found in project '{project_name}'.")
+                })?;
+
+            let new_title = args
+                .get("new_title")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(title);
+            let username = args.get("username").and_then(|v| v.as_str()).unwrap_or(&cur_username);
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or(&cur_url);
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&cur_category);
+            let favorite = args
+                .get("favorite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(cur_favorite != 0);
+            let secret = args.get("secret").and_then(|v| v.as_str()).unwrap_or(&cur_secret);
+            let notes = args.get("notes").and_then(|v| v.as_str()).unwrap_or(&cur_notes);
+
+            conn.execute(
+                "UPDATE credentials SET title=?1, username=?2, secret=?3, url=?4, \
+                                        notes=?5, category=?6, favorite=?7, \
+                                        updated_at=datetime('now') WHERE id=?8",
+                rusqlite::params![
+                    new_title,
+                    username,
+                    secret,
+                    url,
+                    notes,
+                    category,
+                    if favorite { 1 } else { 0 },
+                    id,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            state.touch();
+            Ok(format!(
+                "Updated credential '{title}' in project '{project_name}'."
+            ))
         }
 
         "delete_credential" => {
@@ -813,14 +776,6 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                     "Deleted credential '{title}' from project '{project_name}'."
                 ))
             }
-        }
-
-        "enable_auto_unlock" => {
-            if db::get_setting(&conn, "dpapi_vault_key_blob").is_some() {
-                return Ok("Auto-unlock is already enabled — nothing to do.".to_string());
-            }
-            crate::commands::enable_auto_unlock_from_session(&conn, state)?;
-            Ok("Auto-unlock enabled. This vault will never ask for its master password again on this machine.".to_string())
         }
 
         _ => Err(format!("Unknown tool: {name}")),

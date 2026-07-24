@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result};
 
 #[allow(dead_code)]
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub fn get_db_path() -> String {
     let app_data = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
@@ -13,6 +13,7 @@ pub fn get_db_path() -> String {
 pub fn open() -> Result<Connection> {
     let conn = Connection::open(get_db_path())?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(conn)
 }
 
@@ -163,6 +164,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         set_version(conn, 2)?;
     }
 
+    if v < 3 {
+        // v3: drop at-rest encryption. Column rename only — content may still
+        // be ciphertext at this point for vaults that haven't run the
+        // interactive `finish_migration` command yet; `needs_migration()`
+        // gates all reads/writes until that happens.
+        conn.execute_batch(
+            "ALTER TABLE credentials RENAME COLUMN secret_blob TO secret;
+             ALTER TABLE credentials RENAME COLUMN notes_blob TO notes;
+             ALTER TABLE credentials RENAME COLUMN totp_blob TO totp_secret;
+             ALTER TABLE credentials RENAME COLUMN custom_blob TO custom_fields;",
+        )?;
+        set_version(conn, 3)?;
+    }
+
     Ok(())
 }
 
@@ -195,4 +210,14 @@ pub fn has_legacy_vault(conn: &Connection) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+/// True until the one-time `finish_migration` command has flattened this
+/// vault to plaintext — any of these being present means some data may still
+/// be ciphertext (or, for the ancient legacy table, in a separate schema
+/// entirely) and reads/writes must be blocked until migration completes.
+pub fn needs_migration(conn: &Connection) -> bool {
+    get_setting(conn, "vault_key_blob").is_some()
+        || get_setting(conn, "dpapi_vault_key_blob").is_some()
+        || has_legacy_vault(conn)
 }

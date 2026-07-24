@@ -2,9 +2,8 @@ import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useStore } from "./store";
 import { api } from "./lib/api";
-import { MasterPasswordSetup } from "./components/MasterPasswordSetup";
-import { UnlockScreen } from "./components/UnlockScreen";
-import { MigrateLegacyVault } from "./components/MigrateLegacyVault";
+import { FinalUnlockScreen } from "./components/FinalUnlockScreen";
+import { PinGate } from "./components/PinGate";
 import { AppShell } from "./components/AppShell";
 import { Toaster } from "./components/Toaster";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -50,7 +49,7 @@ function AppRouter() {
   // for an extended period. Browser visibility change is the closest signal.
   useEffect(() => {
     const onHidden = () => {
-      if (document.visibilityState === "hidden" && status?.unlocked) {
+      if (document.visibilityState === "hidden" && status?.pin_set && !status?.locked) {
         // Locking on hidden is too aggressive for normal use; only lock if the
         // window has been hidden for >2 minutes by checking again later.
         setTimeout(() => {
@@ -60,7 +59,7 @@ function AppRouter() {
     };
     document.addEventListener("visibilitychange", onHidden);
     return () => document.removeEventListener("visibilitychange", onHidden);
-  }, [status?.unlocked, lock]);
+  }, [status?.pin_set, status?.locked, lock]);
 
   useAutoLock();
 
@@ -72,9 +71,8 @@ function AppRouter() {
     );
   }
 
-  if (status.legacy && !status.initialized) return <MigrateLegacyVault />;
-  if (!status.initialized) return <MasterPasswordSetup />;
-  if (!status.unlocked) return <UnlockScreen />;
+  if (status.needs_migration) return <FinalUnlockScreen />;
+  if (status.pin_set && status.locked) return <PinGate />;
   return <AppShell />;
 }
 

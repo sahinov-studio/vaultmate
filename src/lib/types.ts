@@ -37,18 +37,15 @@ export interface CredentialWithProject
 }
 
 export interface VaultStatus {
-  initialized: boolean;
-  unlocked: boolean;
-  legacy: boolean;
-  locked_until_ms: number | null;
-  failed_attempts: number;
+  needs_migration: boolean;
+  pin_set: boolean;
+  locked: boolean;
 }
 
 export interface AppSettings {
   auto_lock_minutes: number;
   clipboard_clear_seconds: number;
   mcp_token: string;
-  quick_pin_set: boolean;
 }
 
 export interface TotpResult {

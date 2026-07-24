@@ -33,10 +33,10 @@ interface Store {
 
   status: VaultStatus | null;
   refreshStatus: () => Promise<void>;
-  setupMasterPassword: (password: string) => Promise<void>;
-  unlock: (password: string) => Promise<boolean>;
-  unlockWithPin: (pin: string) => Promise<boolean>;
-  migrate: (oldPin: string, newPassword: string) => Promise<void>;
+  finishMigration: (secret: string, isPin: boolean) => Promise<void>;
+  setPin: (pin: string) => Promise<void>;
+  removePin: () => Promise<void>;
+  verifyPin: (pin: string) => Promise<boolean>;
   lock: () => Promise<void>;
 
   settings: AppSettings | null;
@@ -97,47 +97,37 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  setupMasterPassword: async (password) => {
-    await api.setupMasterPassword(password);
+  finishMigration: async (secret, isPin) => {
+    await api.finishMigration(secret, isPin);
     await get().refreshStatus();
     await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
+    toast.success("Vault migrated — VaultMate will never ask for a password again");
   },
 
-  unlock: async (password) => {
+  setPin: async (pin) => {
+    await api.setPin(pin);
+    await get().refreshStatus();
+  },
+
+  removePin: async () => {
+    await api.removePin();
+    await get().refreshStatus();
+  },
+
+  verifyPin: async (pin) => {
     try {
-      await api.unlockVault(password);
+      await api.verifyPin(pin);
       await get().refreshStatus();
       await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
       return true;
     } catch (e) {
       toast.error(asError(e));
-      await get().refreshStatus();
       return false;
     }
-  },
-
-  unlockWithPin: async (pin) => {
-    try {
-      await api.unlockWithPin(pin);
-      await get().refreshStatus();
-      await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
-      return true;
-    } catch (e) {
-      toast.error(asError(e));
-      await get().refreshStatus();
-      return false;
-    }
-  },
-
-  migrate: async (oldPin, newPassword) => {
-    await api.migrateLegacyVault(oldPin, newPassword);
-    await get().refreshStatus();
-    await Promise.all([get().loadProjects(), get().loadAllCredentials(), get().loadSettings()]);
-    toast.success("Vault migrated successfully");
   },
 
   lock: async () => {
-    await api.lockVault();
+    await api.lockScreen();
     set({
       credentials: [],
       allCredentials: [],

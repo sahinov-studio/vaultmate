@@ -1,16 +1,14 @@
-//! Windows DPAPI wrapper for auto-unlock.
+//! Windows DPAPI wrapper — legacy migration helper only.
 //!
-//! Threat model shift (deliberate, user-approved trade-off): auto-unlock wraps
-//! the raw 32-byte vault key (VK) with `CryptProtectData`, scoped to the
-//! current Windows user profile with no additional entropy. Anyone able to
-//! run code as this Windows user (or read this user's DPAPI master key via a
-//! sufficiently privileged local attack) can recover VK without the master
-//! password. This is strictly opt-in — see `commands::enable_auto_unlock`.
+//! At-rest encryption has been removed entirely (see `crypto.rs`/`db.rs`);
+//! nothing wraps a vault key with DPAPI anymore. This module is kept solely
+//! as a silent-unwrap fallback inside `commands::finish_migration`, for any
+//! vault that had DPAPI auto-unlock enabled before that removal. Once a
+//! vault has migrated there is nothing left to unwrap.
 //!
 //! Every failure path returns `Result::Err`, never panics — required because
 //! the release profile builds with `panic = "abort"`, and a foreign/corrupt
-//! blob (wrong machine, wrong user, tampered bytes) must fail gracefully so
-//! the caller can fall back to the normal password-unlock screen.
+//! blob (wrong machine, wrong user, tampered bytes) must fail gracefully.
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Cryptography::{
@@ -19,6 +17,11 @@ use windows::Win32::Security::Cryptography::{
 use windows::core::PCWSTR;
 
 /// Wrap `plaintext` (the raw VK bytes) with DPAPI, scoped to the current user.
+/// No longer called anywhere post-migration (nothing re-wraps a vault key
+/// once `finish_migration` has run) — kept only so `unprotect` below has a
+/// matching counterpart for anyone reading this file, and in case a future
+/// need for DPAPI wrapping resurfaces.
+#[allow(dead_code)]
 pub fn protect(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     unsafe {
         let input = CRYPT_INTEGER_BLOB {

@@ -96,13 +96,6 @@ pub fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
         .map_err(|_| CryptoError::BadPassword)
 }
 
-pub fn encrypt_string(key: &[u8; 32], plaintext: &str) -> Result<String, CryptoError> {
-    if plaintext.is_empty() {
-        return Ok(String::new());
-    }
-    Ok(hex::encode(encrypt(key, plaintext.as_bytes())?))
-}
-
 pub fn decrypt_string(key: &[u8; 32], blob_hex: &str) -> Result<String, CryptoError> {
     if blob_hex.is_empty() {
         return Ok(String::new());
@@ -123,12 +116,6 @@ impl Drop for VaultKey {
 }
 
 impl VaultKey {
-    pub fn random() -> Self {
-        let mut key = [0u8; VAULT_KEY_LEN];
-        rand::thread_rng().fill_bytes(&mut key);
-        VaultKey(key)
-    }
-
     pub fn as_bytes(&self) -> &[u8; VAULT_KEY_LEN] {
         &self.0
     }

@@ -24,18 +24,14 @@ static IS_QUITTING: AtomicBool = AtomicBool::new(false);
 pub fn run() {
     db::init_db().expect("Failed to initialize database");
 
-    let vault_state = Arc::new(VaultState::new());
-
-    // PAT-style access, no unlock gate: provision a DPAPI-wrapped vault key
-    // automatically on first-ever run (no master password created or asked
-    // for), then silently unlock from it — must not depend on the frontend
-    // mounting, since an autostart launch may keep the window hidden
-    // indefinitely. This is what lets the MCP server start serving
-    // successfully within milliseconds of process launch, every time.
-    if let Ok(conn) = db::open() {
-        commands::ensure_vault_provisioned(&conn);
-        commands::try_auto_unlock(&conn, &vault_state);
-    }
+    // Vault data is plaintext (see crypto.rs/db.rs) — there is no key to
+    // unlock. The only thing gating the GUI is an optional local screen-lock
+    // PIN; start locked only if one is actually configured.
+    let pin_set = db::open()
+        .ok()
+        .map(|conn| db::get_setting(&conn, "screen_pin_hash").is_some())
+        .unwrap_or(false);
+    let vault_state = Arc::new(VaultState::new(pin_set));
 
     mcp::start_mcp_server(Arc::clone(&vault_state));
 
@@ -69,7 +65,10 @@ pub fn run() {
                         }
                     }
                     "lock" => {
-                        app.state::<Arc<VaultState>>().lock();
+                        // Inert if no screen-lock PIN is configured — App.tsx
+                        // only gates on `pin_set && locked` together, so this
+                        // is a safe no-op for the common no-PIN vault.
+                        app.state::<Arc<VaultState>>().lock_screen();
                     }
                     "quit" => {
                         IS_QUITTING.store(true, Ordering::SeqCst);
@@ -116,22 +115,16 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            // Auth
+            // Auth / migration / screen lock
             commands::vault_status,
-            commands::setup_master_password,
-            commands::unlock_vault,
-            commands::unlock_with_pin,
-            commands::lock_vault,
+            commands::finish_migration,
+            commands::set_pin,
+            commands::remove_pin,
+            commands::verify_pin,
+            commands::lock_screen,
             commands::touch_activity,
             commands::idle_seconds,
-            commands::change_master_password,
-            commands::migrate_legacy_vault,
-            commands::enable_quick_pin,
-            commands::disable_quick_pin,
-            // Auto-unlock (DPAPI) + autostart
-            commands::enable_auto_unlock,
-            commands::disable_auto_unlock,
-            commands::is_auto_unlock_enabled,
+            // Autostart
             commands::enable_autostart,
             commands::disable_autostart,
             commands::is_autostart_enabled,

@@ -26,27 +26,18 @@ interface CredentialPayload {
 }
 
 export const api = {
-  // ── Auth ───────────────────────────────────────────────────────────
+  // ── Auth / migration / screen lock ──────────────────────────────────
   vaultStatus: () => invoke<VaultStatus>("vault_status"),
-  setupMasterPassword: (password: string) =>
-    invoke<void>("setup_master_password", { password }),
-  unlockVault: (password: string) => invoke<void>("unlock_vault", { password }),
-  unlockWithPin: (pin: string) => invoke<void>("unlock_with_pin", { pin }),
-  lockVault: () => invoke<void>("lock_vault"),
+  finishMigration: (secret: string, isPin: boolean) =>
+    invoke<void>("finish_migration", { secret, isPin }),
+  setPin: (pin: string) => invoke<void>("set_pin", { pin }),
+  removePin: () => invoke<void>("remove_pin"),
+  verifyPin: (pin: string) => invoke<void>("verify_pin", { pin }),
+  lockScreen: () => invoke<void>("lock_screen"),
   touchActivity: () => invoke<number>("touch_activity"),
   idleSeconds: () => invoke<number>("idle_seconds"),
-  changeMasterPassword: (current: string, newPassword: string) =>
-    invoke<void>("change_master_password", { current, newPassword }),
-  migrateLegacyVault: (oldPin: string, newPassword: string) =>
-    invoke<void>("migrate_legacy_vault", { oldPin, newPassword }),
-  enableQuickPin: (pin: string) => invoke<void>("enable_quick_pin", { pin }),
-  disableQuickPin: () => invoke<void>("disable_quick_pin"),
 
-  // ── Auto-unlock (DPAPI) + autostart ────────────────────────────────
-  enableAutoUnlock: (password: string) =>
-    invoke<void>("enable_auto_unlock", { password }),
-  disableAutoUnlock: () => invoke<void>("disable_auto_unlock"),
-  isAutoUnlockEnabled: () => invoke<boolean>("is_auto_unlock_enabled"),
+  // ── Autostart ────────────────────────────────────────────────────
   enableAutostart: () => invoke<void>("enable_autostart"),
   disableAutostart: () => invoke<void>("disable_autostart"),
   isAutostartEnabled: () => invoke<boolean>("is_autostart_enabled"),

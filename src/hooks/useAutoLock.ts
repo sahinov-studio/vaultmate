@@ -1,7 +1,8 @@
 import { useEffect, useRef } from "react";
 import { useStore } from "../store";
 
-/// Locks the vault after `autoLockMinutes` of user inactivity.
+/// Locks the screen after `autoLockMinutes` of user inactivity — a no-op
+/// unless a screen-lock PIN is configured (nothing to lock to otherwise).
 /// Activity = mouse, keyboard, scroll, touch, focus events anywhere in the document.
 /// The countdown resets on every event.
 export function useAutoLock() {
@@ -10,8 +11,10 @@ export function useAutoLock() {
   const lock = useStore((s) => s.lock);
   const lastActivity = useRef(Date.now());
 
+  const active = !!status?.pin_set && !status?.locked;
+
   useEffect(() => {
-    if (!status?.unlocked) return;
+    if (!active) return;
     const events: (keyof DocumentEventMap)[] = [
       "mousemove",
       "mousedown",
@@ -27,10 +30,10 @@ export function useAutoLock() {
     return () => {
       events.forEach((e) => document.removeEventListener(e, onActivity));
     };
-  }, [status?.unlocked]);
+  }, [active]);
 
   useEffect(() => {
-    if (!status?.unlocked) return;
+    if (!active) return;
     const minutes = settings?.auto_lock_minutes ?? 5;
     const ms = minutes * 60_000;
     const t = setInterval(() => {
@@ -39,5 +42,5 @@ export function useAutoLock() {
       }
     }, 5_000);
     return () => clearInterval(t);
-  }, [status?.unlocked, settings?.auto_lock_minutes, lock]);
+  }, [active, settings?.auto_lock_minutes, lock]);
 }

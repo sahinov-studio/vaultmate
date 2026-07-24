@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, KeyRound, RefreshCw, Copy, Check, AlertTriangle, Power } from "lucide-react";
+import { KeyRound, RefreshCw, Copy, Check, AlertTriangle, Power } from "lucide-react";
 import { useStore } from "../store";
 import { api } from "../lib/api";
 import { toast, asError } from "../lib/toast";
@@ -109,29 +109,24 @@ function GeneralTab() {
   );
 }
 
-// ── Security ─────────────────────────────────────────────────────────────────
+// ── Security (Screen Lock) ────────────────────────────────────────────────────
 function SecurityTab() {
-  const settings = useStore((s) => s.settings);
-  const loadSettings = useStore((s) => s.loadSettings);
+  const status = useStore((s) => s.status);
+  const setPin = useStore((s) => s.setPin);
+  const removePin = useStore((s) => s.removePin);
 
-  const [current, setCurrent] = useState("");
-  const [next, setNext] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [show, setShow] = useState(false);
+  const [pinValue, setPinValue] = useState("");
+  const [confirmPin, setConfirmPin] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const [pin, setPin] = useState("");
-  const [confirmPin, setConfirmPin] = useState("");
-
-  const changePw = async () => {
-    if (next.length < 8) return toast.error("New password must be at least 8 characters");
-    if (next !== confirm) return toast.error("Passwords do not match");
+  const enable = async () => {
+    if (pinValue.length < 4) return toast.error("PIN must be at least 4 digits");
+    if (pinValue !== confirmPin) return toast.error("PINs do not match");
     setBusy(true);
     try {
-      await api.changeMasterPassword(current, next);
-      setCurrent(""); setNext(""); setConfirm("");
-      toast.success("Master password updated. Quick PIN was disabled.");
-      await loadSettings();
+      await setPin(pinValue);
+      setPinValue(""); setConfirmPin("");
+      toast.success("Screen-lock PIN set");
     } catch (e) {
       toast.error(asError(e));
     } finally {
@@ -139,125 +134,66 @@ function SecurityTab() {
     }
   };
 
-  const enablePin = async () => {
-    if (pin.length < 4) return toast.error("PIN must be at least 4 digits");
-    if (pin !== confirmPin) return toast.error("PINs do not match");
+  const disable = async () => {
     try {
-      await api.enableQuickPin(pin);
-      setPin(""); setConfirmPin("");
-      await loadSettings();
-      toast.success("Quick PIN enabled");
-    } catch (e) {
-      toast.error(asError(e));
-    }
-  };
-
-  const disablePin = async () => {
-    try {
-      await api.disableQuickPin();
-      await loadSettings();
-      toast.success("Quick PIN disabled");
+      await removePin();
+      toast.success("Screen-lock PIN removed");
     } catch (e) {
       toast.error(asError(e));
     }
   };
 
   return (
-    <div className="flex flex-col gap-6">
-      <section className="space-y-3">
-        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Master password</h3>
-        <Field label="Current password">
-          <div className="relative">
-            <input
-              type={show ? "text" : "password"}
-              value={current}
-              onChange={(e) => setCurrent(e.target.value)}
-              className={`${inputCls} pr-10`}
-            />
-            <button
-              type="button"
-              onClick={() => setShow((s) => !s)}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400"
-            >
-              {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-            </button>
-          </div>
-        </Field>
-        <Field label="New password">
-          <input
-            type={show ? "text" : "password"}
-            value={next}
-            onChange={(e) => setNext(e.target.value)}
-            className={inputCls}
-          />
-        </Field>
-        <Field label="Confirm new password">
-          <input
-            type={show ? "text" : "password"}
-            value={confirm}
-            onChange={(e) => setConfirm(e.target.value)}
-            className={inputCls}
-          />
-        </Field>
-        <button
-          onClick={changePw}
-          disabled={busy || !current || !next}
-          className="self-end rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
-        >
-          Change password
-        </button>
-      </section>
-
-      <section className="space-y-3 border-t border-slate-200 pt-5 dark:border-slate-700/50">
-        <div className="flex items-start gap-2">
-          <KeyRound className="h-4 w-4 mt-1 text-slate-400" />
-          <div>
-            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Quick unlock PIN</h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              {settings?.quick_pin_set
-                ? "A PIN is set up — you can use it to unlock without typing your master password."
-                : "Optional. Lets you unlock with a short PIN. Less secure than your master password."}
-            </p>
-          </div>
+    <div className="flex flex-col gap-4">
+      <div className="flex items-start gap-2">
+        <KeyRound className="h-4 w-4 mt-1 text-slate-400" />
+        <div>
+          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Screen Lock</h3>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Optional local PIN gate for this window — a screen-privacy convenience, not
+            encryption. VaultMate stores credentials in plaintext on this machine, by design.
+            If no PIN is set, the app never gates access at all.
+          </p>
         </div>
-        {settings?.quick_pin_set ? (
+      </div>
+      {status?.pin_set ? (
+        <button
+          onClick={disable}
+          className="self-start rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-600 hover:bg-red-500/20 dark:text-red-400"
+        >
+          Remove PIN
+        </button>
+      ) : (
+        <div className="space-y-2">
+          <Field label="PIN (4–12 digits)">
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={12}
+              value={pinValue}
+              onChange={(e) => setPinValue(e.target.value.replace(/\D/g, ""))}
+              className={inputCls}
+            />
+          </Field>
+          <Field label="Confirm PIN">
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={12}
+              value={confirmPin}
+              onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, ""))}
+              className={inputCls}
+            />
+          </Field>
           <button
-            onClick={disablePin}
-            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-600 hover:bg-red-500/20 dark:text-red-400"
+            onClick={enable}
+            disabled={busy}
+            className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-40"
           >
-            Disable Quick PIN
+            Set PIN
           </button>
-        ) : (
-          <div className="space-y-2">
-            <Field label="PIN (4–12 digits)">
-              <input
-                type="password"
-                inputMode="numeric"
-                maxLength={12}
-                value={pin}
-                onChange={(e) => setPin(e.target.value.replace(/\D/g, ""))}
-                className={inputCls}
-              />
-            </Field>
-            <Field label="Confirm PIN">
-              <input
-                type="password"
-                inputMode="numeric"
-                maxLength={12}
-                value={confirmPin}
-                onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, ""))}
-                className={inputCls}
-              />
-            </Field>
-            <button
-              onClick={enablePin}
-              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500"
-            >
-              Enable Quick PIN
-            </button>
-          </div>
-        )}
-      </section>
+        </div>
+      )}
     </div>
   );
 }
@@ -335,18 +271,10 @@ function McpTab() {
 // ── Startup ──────────────────────────────────────────────────────────────────
 function StartupTab() {
   const [autostart, setAutostart] = useState(false);
-  const [autoUnlock, setAutoUnlock] = useState(false);
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
 
   const refresh = async () => {
     try {
-      const [as, au] = await Promise.all([
-        api.isAutostartEnabled(),
-        api.isAutoUnlockEnabled(),
-      ]);
-      setAutostart(as);
-      setAutoUnlock(au);
+      setAutostart(await api.isAutostartEnabled());
     } catch (e) {
       toast.error(asError(e));
     }
@@ -367,31 +295,6 @@ function StartupTab() {
     }
   };
 
-  const enableAutoUnlock = async () => {
-    if (!password) return toast.error("Enter your master password");
-    setBusy(true);
-    try {
-      await api.enableAutoUnlock(password);
-      setPassword("");
-      setAutoUnlock(true);
-      toast.success("Auto-unlock enabled");
-    } catch (e) {
-      toast.error(asError(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const disableAutoUnlock = async () => {
-    try {
-      await api.disableAutoUnlock();
-      setAutoUnlock(false);
-      toast.success("Auto-unlock disabled");
-    } catch (e) {
-      toast.error(asError(e));
-    }
-  };
-
   return (
     <div className="flex flex-col gap-6">
       <section className="space-y-3">
@@ -401,7 +304,8 @@ function StartupTab() {
             <div>
               <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Start at login</h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Launch VaultMate in the background (system tray) when you log into Windows.
+                Launch VaultMate in the background (system tray) when you log into Windows —
+                keeps it running so Claude/MCP can always reach it.
               </p>
             </div>
           </div>
@@ -417,54 +321,6 @@ function StartupTab() {
             </span>
           </label>
         </div>
-      </section>
-
-      <section className="space-y-3 border-t border-slate-200 pt-5 dark:border-slate-700/50">
-        <div className="flex items-start gap-2">
-          <KeyRound className="h-4 w-4 mt-1 text-slate-400" />
-          <div>
-            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Auto-unlock</h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Unlock automatically at startup using Windows' own credential protection (DPAPI),
-              instead of typing your master password every time.
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
-          <p className="text-xs text-amber-700 dark:text-amber-400">
-            Anyone signed into this Windows account can unlock this vault without your master
-            password. Only enable this on a machine only you use.
-          </p>
-        </div>
-
-        {autoUnlock ? (
-          <button
-            onClick={disableAutoUnlock}
-            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-600 hover:bg-red-500/20 dark:text-red-400"
-          >
-            Disable auto-unlock
-          </button>
-        ) : (
-          <div className="space-y-2">
-            <Field label="Confirm master password">
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={inputCls}
-              />
-            </Field>
-            <button
-              onClick={enableAutoUnlock}
-              disabled={busy || !password}
-              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-40"
-            >
-              Enable auto-unlock
-            </button>
-          </div>
-        )}
       </section>
     </div>
   );
@@ -500,8 +356,8 @@ function DangerTab() {
           <h3 className="text-sm font-semibold text-red-600 dark:text-red-400">Wipe all data</h3>
         </div>
         <p className="mb-3 text-xs text-slate-600 dark:text-slate-400">
-          Deletes every project and credential from this vault. Your master password is kept
-          so you can start fresh. This cannot be undone.
+          Deletes every project and credential from this vault so you can start fresh. This
+          cannot be undone.
         </p>
         <Field label='Type "DELETE" to confirm'>
           <input

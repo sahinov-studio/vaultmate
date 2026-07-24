@@ -4,10 +4,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::crypto::{
-    decrypt_string, derive_key, encrypt_string, random_bytes, totp_code, VaultKey, SALT_LEN,
-    VAULT_KEY_LEN,
-};
+use crate::crypto::{decrypt_string, derive_key, random_bytes, totp_code, VaultKey, SALT_LEN, VAULT_KEY_LEN};
 use crate::db;
 use crate::state::VaultState;
 
@@ -81,13 +78,17 @@ pub struct CredentialWithProject {
     pub last_used_at: String,
 }
 
+/// PAT-only model: `needs_migration` is true only for a vault that predates
+/// the removal of at-rest encryption and still has an old master-password
+/// (or DPAPI) vault key, or an ancient pre-encryption legacy table. Once
+/// `finish_migration` runs, it's false forever and stays false for every
+/// fresh install. `pin_set`/`locked` describe the optional, purely local
+/// screen-lock PIN — never a factor in MCP access, see `mcp.rs`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VaultStatus {
-    pub initialized: bool,
-    pub unlocked: bool,
-    pub legacy: bool,
-    pub locked_until_ms: Option<i64>,
-    pub failed_attempts: i64,
+    pub needs_migration: bool,
+    pub pin_set: bool,
+    pub locked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -95,49 +96,41 @@ pub struct AppSettings {
     pub auto_lock_minutes: i64,
     pub clipboard_clear_seconds: i64,
     pub mcp_token: String,
-    pub quick_pin_set: bool,
 }
 
-const CRED_COLS: &str = "id, project_id, title, username, secret_blob, url, notes_blob, category, \
-                         tags, favorite, totp_blob, custom_blob, expiry_date, last_used_at, \
+const CRED_COLS: &str = "id, project_id, title, username, secret, url, notes, category, \
+                         tags, favorite, totp_secret, custom_fields, expiry_date, last_used_at, \
                          created_at, updated_at";
 
 // Identical columns but with the `c.` table qualifier — required in JOIN queries where
 // both `credentials c` and `projects p` share column names (`id`, `created_at`).
 const CRED_COLS_JOIN: &str =
-    "c.id, c.project_id, c.title, c.username, c.secret_blob, c.url, c.notes_blob, c.category, \
-     c.tags, c.favorite, c.totp_blob, c.custom_blob, c.expiry_date, c.last_used_at, \
+    "c.id, c.project_id, c.title, c.username, c.secret, c.url, c.notes, c.category, \
+     c.tags, c.favorite, c.totp_secret, c.custom_fields, c.expiry_date, c.last_used_at, \
      c.created_at, c.updated_at";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn row_to_credential(
-    row: &rusqlite::Row,
-    key: &VaultKey,
-) -> Result<Credential, rusqlite::Error> {
+fn row_to_credential(row: &rusqlite::Row) -> Result<Credential, rusqlite::Error> {
     let tags_json: String = row.get(8).unwrap_or_else(|_| "[]".to_string());
-    let custom_blob: String = row.get(11).unwrap_or_default();
-    let custom_decrypted = decrypt_string(key.as_bytes(), &custom_blob).unwrap_or_default();
-    let custom: Vec<CustomField> = if custom_decrypted.is_empty() {
+    let custom_json: String = row.get(11).unwrap_or_default();
+    let custom: Vec<CustomField> = if custom_json.is_empty() {
         Vec::new()
     } else {
-        serde_json::from_str(&custom_decrypted).unwrap_or_default()
+        serde_json::from_str(&custom_json).unwrap_or_default()
     };
     Ok(Credential {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
         username: row.get(3).unwrap_or_default(),
-        secret: decrypt_string(key.as_bytes(), &row.get::<_, String>(4).unwrap_or_default())
-            .unwrap_or_default(),
+        secret: row.get(4).unwrap_or_default(),
         url: row.get(5).unwrap_or_default(),
-        notes: decrypt_string(key.as_bytes(), &row.get::<_, String>(6).unwrap_or_default())
-            .unwrap_or_default(),
+        notes: row.get(6).unwrap_or_default(),
         category: row.get(7).unwrap_or_else(|_| "other".to_string()),
         tags: serde_json::from_str(&tags_json).unwrap_or_default(),
         favorite: row.get::<_, i64>(9).unwrap_or(0) != 0,
-        totp_secret: decrypt_string(key.as_bytes(), &row.get::<_, String>(10).unwrap_or_default())
-            .unwrap_or_default(),
+        totp_secret: row.get(10).unwrap_or_default(),
         custom_fields: custom,
         expiry_date: row.get(12).unwrap_or_default(),
         last_used_at: row.get(13).unwrap_or_default(),
@@ -146,160 +139,234 @@ fn row_to_credential(
     })
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn rate_limit_check(conn: &rusqlite::Connection) -> Result<(), String> {
-    let locked_until: i64 = db::get_setting(conn, "locked_until_ms")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if locked_until > now_ms() {
-        let secs = (locked_until - now_ms()) / 1000;
-        return Err(format!(
-            "Too many failed attempts. Try again in {secs} seconds."
-        ));
+/// Single chokepoint blocking all credential/project reads and writes while
+/// a vault still has old encrypted data waiting on `finish_migration`.
+fn require_migrated(conn: &rusqlite::Connection) -> Result<(), String> {
+    if db::needs_migration(conn) {
+        return Err(
+            "Vault needs a one-time migration — open VaultMate to finish it.".to_string(),
+        );
     }
     Ok(())
 }
 
-fn record_failed_attempt(conn: &rusqlite::Connection) {
-    let attempts: i64 = db::get_setting(conn, "failed_attempts")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-        + 1;
-    let _ = db::set_setting(conn, "failed_attempts", &attempts.to_string());
-    if attempts >= 5 {
-        // Exponential backoff capped at 30 minutes.
-        let delay_secs = std::cmp::min(2_i64.pow((attempts - 4).min(11) as u32) * 5, 1800);
-        let until = now_ms() + delay_secs * 1000;
-        let _ = db::set_setting(conn, "locked_until_ms", &until.to_string());
-    }
-}
-
-fn clear_failed_attempts(conn: &rusqlite::Connection) {
-    let _ = db::set_setting(conn, "failed_attempts", "0");
-    let _ = db::set_setting(conn, "locked_until_ms", "0");
-}
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
+// ── Auth / vault status ───────────────────────────────────────────────────────
 
 #[tauri::command]
 pub fn vault_status(state: State<'_, Arc<VaultState>>) -> Result<VaultStatus, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    // A PAT-style, DPAPI-only vault (auto-provisioned, no master password
-    // ever set) is just as "initialized" as a password-protected one — it
-    // must not fall through to the master-password setup screen.
-    let initialized = db::get_setting(&conn, "vault_key_blob").is_some()
-        || db::get_setting(&conn, "dpapi_vault_key_blob").is_some();
-    let legacy = db::has_legacy_vault(&conn) || db::get_setting(&conn, "pin_hash").is_some();
-    let locked_until: i64 = db::get_setting(&conn, "locked_until_ms")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let attempts: i64 = db::get_setting(&conn, "failed_attempts")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     Ok(VaultStatus {
-        initialized,
-        unlocked: state.is_unlocked(),
-        legacy: legacy && !initialized,
-        locked_until_ms: if locked_until > now_ms() {
-            Some(locked_until)
-        } else {
-            None
-        },
-        failed_attempts: attempts,
+        needs_migration: db::needs_migration(&conn),
+        pin_set: db::get_setting(&conn, "screen_pin_hash").is_some(),
+        locked: state.is_locked(),
     })
 }
 
+/// One-time flatten: recovers the vault key (from a master password, quick
+/// PIN, or a silently-unwrapped DPAPI blob), decrypts every existing
+/// credential field, rewrites it as plaintext, copies over any ancient
+/// pre-encryption legacy rows verbatim, and deletes every crypto-related
+/// setting. Wrapped in one transaction — a crash mid-migration leaves the DB
+/// untouched (transaction never committed) and `needs_migration` still true,
+/// so it's always safe to just retry.
 #[tauri::command]
-pub fn setup_master_password(
-    password: String,
-    state: State<'_, Arc<VaultState>>,
-) -> Result<(), String> {
-    if password.len() < 8 {
-        return Err("Master password must be at least 8 characters".to_string());
+pub fn finish_migration(secret: String, is_pin: bool) -> Result<(), String> {
+    let mut conn = db::open().map_err(|e| e.to_string())?;
+
+    let vk_bytes: [u8; VAULT_KEY_LEN] = if let Some(blob_hex) =
+        db::get_setting(&conn, "dpapi_vault_key_blob")
+    {
+        let blob = hex::decode(blob_hex).map_err(|_| "Corrupt DPAPI blob".to_string())?;
+        let bytes = crate::dpapi::unprotect(&blob)?;
+        if bytes.len() != VAULT_KEY_LEN {
+            return Err("Corrupt vault key".to_string());
+        }
+        let mut arr = [0u8; VAULT_KEY_LEN];
+        arr.copy_from_slice(&bytes);
+        arr
+    } else if db::get_setting(&conn, "vault_key_blob").is_none() {
+        // No v2 vault key at all — either a brand-new/already-migrated vault
+        // (finish_migration shouldn't have been reachable), or a pure
+        // ancient-legacy vault with only the pre-encryption table, which
+        // needs no key at all (handled by the plaintext copy below).
+        [0u8; VAULT_KEY_LEN]
+    } else {
+        let (salt_key, blob_key) = if is_pin {
+            ("quick_pin_salt", "quick_pin_blob")
+        } else {
+            ("master_salt", "vault_key_blob")
+        };
+        let salt_hex = db::get_setting(&conn, salt_key)
+            .ok_or_else(|| if is_pin { "Quick PIN is not set" } else { "Vault is not initialized" }.to_string())?;
+        let blob_hex = db::get_setting(&conn, blob_key).ok_or("Vault is not initialized")?;
+        let salt = hex::decode(salt_hex).map_err(|_| "Corrupt salt".to_string())?;
+        let blob = hex::decode(blob_hex).map_err(|_| "Corrupt vault key".to_string())?;
+        let dk = derive_key(&secret, &salt)?;
+        let bytes = crate::crypto::decrypt(&dk, &blob).map_err(|_| {
+            if is_pin { "Incorrect PIN".to_string() } else { "Incorrect master password".to_string() }
+        })?;
+        if bytes.len() != VAULT_KEY_LEN {
+            return Err("Corrupt vault key".to_string());
+        }
+        let mut arr = [0u8; VAULT_KEY_LEN];
+        arr.copy_from_slice(&bytes);
+        arr
+    };
+    let vk = VaultKey(vk_bytes);
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    {
+        let mut stmt = tx
+            .prepare("SELECT id, secret, notes, totp_secret, custom_fields FROM credentials")
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, String, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1).unwrap_or_default(),
+                    row.get(2).unwrap_or_default(),
+                    row.get(3).unwrap_or_default(),
+                    row.get(4).unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        // Defensive: if a value doesn't decrypt (not valid hex, or AEAD auth
+        // failure), treat it as already-plaintext rather than aborting —
+        // cheap insurance against any migration-gating gap.
+        let flatten = |v: &str| -> String {
+            decrypt_string(vk.as_bytes(), v).unwrap_or_else(|_| v.to_string())
+        };
+
+        for (id, secret_v, notes_v, totp_v, custom_v) in rows {
+            tx.execute(
+                "UPDATE credentials SET secret=?1, notes=?2, totp_secret=?3, custom_fields=?4 WHERE id=?5",
+                params![flatten(&secret_v), flatten(&notes_v), flatten(&totp_v), flatten(&custom_v), id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    if db::has_legacy_vault(&tx) {
+        struct LegacyRow {
+            project_id: i64,
+            title: String,
+            username: String,
+            secret: String,
+            url: String,
+            notes: String,
+            category: String,
+            created_at: String,
+            updated_at: String,
+        }
+        let mut stmt = tx
+            .prepare(
+                "SELECT project_id, title, username, secret, url, notes, category, \
+                       created_at, updated_at FROM credentials_legacy_v0",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<LegacyRow> = stmt
+            .query_map([], |row| {
+                Ok(LegacyRow {
+                    project_id: row.get(0)?,
+                    title: row.get(1)?,
+                    username: row.get(2).unwrap_or_default(),
+                    secret: row.get(3).unwrap_or_default(),
+                    url: row.get(4).unwrap_or_default(),
+                    notes: row.get(5).unwrap_or_default(),
+                    category: row.get(6).unwrap_or_else(|_| "other".to_string()),
+                    created_at: row.get(7).unwrap_or_default(),
+                    updated_at: row.get(8).unwrap_or_default(),
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        for r in rows {
+            tx.execute(
+                "INSERT INTO credentials (project_id, title, username, secret, url, notes, \
+                                          category, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    r.project_id, r.title, r.username, r.secret, r.url, r.notes, r.category,
+                    r.created_at, r.updated_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute("DROP TABLE credentials_legacy_v0", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    for key in [
+        "master_salt", "vault_key_blob", "dpapi_vault_key_blob",
+        "quick_pin_salt", "quick_pin_blob", "pin_hash",
+    ] {
+        tx.execute("DELETE FROM settings WHERE key=?1", params![key])
+            .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── Screen-lock PIN (local UI nuisance-gate only; see state.rs / mcp.rs) ──────
+
+#[tauri::command]
+pub fn set_pin(pin: String) -> Result<(), String> {
+    if pin.len() < 4 {
+        return Err("PIN must be at least 4 digits".to_string());
     }
     let conn = db::open().map_err(|e| e.to_string())?;
-    if db::get_setting(&conn, "vault_key_blob").is_some() {
-        return Err("Vault is already initialized".to_string());
-    }
-
     let salt = random_bytes(SALT_LEN);
-    let dk = derive_key(&password, &salt)?;
-    let vk = VaultKey::random();
-    let blob = crate::crypto::encrypt(&dk, vk.as_bytes())?;
-
-    db::set_setting(&conn, "master_salt", &hex::encode(&salt)).map_err(|e| e.to_string())?;
-    db::set_setting(&conn, "vault_key_blob", &hex::encode(&blob)).map_err(|e| e.to_string())?;
-
-    state.unlock(vk);
-    clear_failed_attempts(&conn);
+    let hash = derive_key(&pin, &salt)?;
+    db::set_setting(&conn, "screen_pin_salt", &hex::encode(&salt)).map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "screen_pin_hash", &hex::encode(hash)).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn unlock_vault(password: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
+pub fn remove_pin(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    rate_limit_check(&conn)?;
-    let salt_hex = db::get_setting(&conn, "master_salt").ok_or("Vault is not initialized")?;
-    let blob_hex = db::get_setting(&conn, "vault_key_blob").ok_or("Vault is not initialized")?;
-    let salt = hex::decode(salt_hex).map_err(|_| "Corrupt salt".to_string())?;
-    let blob = hex::decode(blob_hex).map_err(|_| "Corrupt vault key".to_string())?;
-    let dk = derive_key(&password, &salt)?;
-
-    match crate::crypto::decrypt(&dk, &blob) {
-        Ok(vk_bytes) if vk_bytes.len() == VAULT_KEY_LEN => {
-            let mut arr = [0u8; VAULT_KEY_LEN];
-            arr.copy_from_slice(&vk_bytes);
-            state.unlock(VaultKey(arr));
-            clear_failed_attempts(&conn);
-            Ok(())
-        }
-        _ => {
-            record_failed_attempt(&conn);
-            Err("Incorrect master password".to_string())
-        }
-    }
+    db::delete_setting(&conn, "screen_pin_salt").map_err(|e| e.to_string())?;
+    db::delete_setting(&conn, "screen_pin_hash").map_err(|e| e.to_string())?;
+    state.record_pin_success(); // clears any lock/cooldown state
+    Ok(())
 }
 
 #[tauri::command]
-pub fn unlock_with_pin(pin: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
+pub fn verify_pin(pin: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
+    state.check_pin_cooldown()?;
     let conn = db::open().map_err(|e| e.to_string())?;
-    rate_limit_check(&conn)?;
-    let salt_hex = db::get_setting(&conn, "quick_pin_salt").ok_or("Quick PIN is not set")?;
-    let blob_hex = db::get_setting(&conn, "quick_pin_blob").ok_or("Quick PIN is not set")?;
+    let salt_hex = db::get_setting(&conn, "screen_pin_salt").ok_or("No PIN set")?;
+    let hash_hex = db::get_setting(&conn, "screen_pin_hash").ok_or("No PIN set")?;
     let salt = hex::decode(salt_hex).map_err(|_| "Corrupt PIN salt".to_string())?;
-    let blob = hex::decode(blob_hex).map_err(|_| "Corrupt PIN blob".to_string())?;
-    let dk = derive_key(&pin, &salt)?;
-
-    match crate::crypto::decrypt(&dk, &blob) {
-        Ok(vk_bytes) if vk_bytes.len() == VAULT_KEY_LEN => {
-            let mut arr = [0u8; VAULT_KEY_LEN];
-            arr.copy_from_slice(&vk_bytes);
-            state.unlock(VaultKey(arr));
-            clear_failed_attempts(&conn);
-            Ok(())
-        }
-        _ => {
-            record_failed_attempt(&conn);
-            Err("Incorrect PIN".to_string())
-        }
+    let expected = hex::decode(hash_hex).map_err(|_| "Corrupt PIN hash".to_string())?;
+    let actual = derive_key(&pin, &salt).map_err(|e| e.to_string())?;
+    if actual.as_slice() == expected.as_slice() {
+        state.record_pin_success();
+        Ok(())
+    } else {
+        state.record_pin_failure();
+        Err("Incorrect PIN".to_string())
     }
 }
 
 #[tauri::command]
-pub fn lock_vault(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    state.lock();
+pub fn lock_screen(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
+    state.lock_screen();
     Ok(())
 }
 
 #[tauri::command]
 pub fn touch_activity(state: State<'_, Arc<VaultState>>) -> Result<i64, String> {
-    if !state.is_unlocked() {
+    if state.is_locked() {
         return Ok(-1);
     }
     state.touch();
@@ -309,140 +376,6 @@ pub fn touch_activity(state: State<'_, Arc<VaultState>>) -> Result<i64, String> 
 #[tauri::command]
 pub fn idle_seconds(state: State<'_, Arc<VaultState>>) -> Result<i64, String> {
     Ok(state.idle_for().as_secs() as i64)
-}
-
-// ── Quick PIN management ──────────────────────────────────────────────────────
-
-#[tauri::command]
-pub fn enable_quick_pin(pin: String, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    if pin.len() < 4 {
-        return Err("PIN must be at least 4 digits".to_string());
-    }
-    let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<(), String> {
-        let salt = random_bytes(SALT_LEN);
-        let dk = derive_key(&pin, &salt)?;
-        let blob = crate::crypto::encrypt(&dk, vk.as_bytes())?;
-        db::set_setting(&conn, "quick_pin_salt", &hex::encode(&salt)).map_err(|e| e.to_string())?;
-        db::set_setting(&conn, "quick_pin_blob", &hex::encode(&blob)).map_err(|e| e.to_string())?;
-        Ok(())
-    })?
-}
-
-#[tauri::command]
-pub fn disable_quick_pin() -> Result<(), String> {
-    let conn = db::open().map_err(|e| e.to_string())?;
-    db::delete_setting(&conn, "quick_pin_salt").map_err(|e| e.to_string())?;
-    db::delete_setting(&conn, "quick_pin_blob").map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-// ── DPAPI auto-unlock (Windows only; default, not opt-in) ────────────────────
-//
-// PAT-style access model: the MCP bearer token is the only credential a
-// client needs, forever, same as a Supabase personal access token — no
-// master password screen, no Settings toggle. Data is still DPAPI-encrypted
-// at rest (a copied-off `vaultmate.db` is useless without this exact Windows
-// user's DPAPI master key), but there is no human-facing unlock gate at all.
-//
-// `enable_auto_unlock` (password-based, kept for anyone migrating a vault
-// that still has an explicit master password from before this model existed)
-// wraps the raw VK with DPAPI. Deliberately re-verifies the password fresh
-// here rather than trusting session state, in case it's ever called from a
-// context that isn't already gated on being unlocked.
-
-#[tauri::command]
-pub fn enable_auto_unlock(password: String, _state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    let conn = db::open().map_err(|e| e.to_string())?;
-    let salt_hex = db::get_setting(&conn, "master_salt").ok_or("Vault is not initialized")?;
-    let blob_hex = db::get_setting(&conn, "vault_key_blob").ok_or("Vault is not initialized")?;
-    let salt = hex::decode(salt_hex).map_err(|_| "Corrupt salt".to_string())?;
-    let blob = hex::decode(blob_hex).map_err(|_| "Corrupt vault key".to_string())?;
-    let dk = derive_key(&password, &salt)?;
-
-    let vk_bytes = crate::crypto::decrypt(&dk, &blob).map_err(|_| "Incorrect master password".to_string())?;
-    if vk_bytes.len() != VAULT_KEY_LEN {
-        return Err("Corrupt vault key".to_string());
-    }
-    let dpapi_blob = crate::dpapi::protect(&vk_bytes)?;
-    db::set_setting(&conn, "dpapi_vault_key_blob", &hex::encode(&dpapi_blob))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn disable_auto_unlock(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
-    let conn = db::open().map_err(|e| e.to_string())?;
-    db::delete_setting(&conn, "dpapi_vault_key_blob").map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn is_auto_unlock_enabled() -> Result<bool, String> {
-    let conn = db::open().map_err(|e| e.to_string())?;
-    Ok(db::get_setting(&conn, "dpapi_vault_key_blob").is_some())
-}
-
-/// Wraps the currently-unlocked session's VK with DPAPI, without needing the
-/// master password at all — safe because reaching this requires the vault to
-/// already be unlocked (enforced by the MCP server's own gate, or by the
-/// caller). This is how an existing password-protected vault migrates to the
-/// zero-friction PAT-style model with no further password entry, ever.
-pub fn enable_auto_unlock_from_session(
-    conn: &rusqlite::Connection,
-    state: &VaultState,
-) -> Result<(), String> {
-    state.with_key(|vk| {
-        let dpapi_blob = crate::dpapi::protect(vk.as_bytes())?;
-        db::set_setting(conn, "dpapi_vault_key_blob", &hex::encode(&dpapi_blob))
-            .map_err(|e| e.to_string())
-    })?
-}
-
-/// Called once, unconditionally, at every process start (`lib.rs::run()`,
-/// before `try_auto_unlock`). If this is a brand-new install with no vault at
-/// all, generates a random VK and DPAPI-wraps it immediately — no master
-/// password is ever created or asked for. This is what makes a fresh
-/// VaultMate install usable the instant it's launched: generate an MCP
-/// token, share it, and every read/add/update/delete just works from then on.
-pub fn ensure_vault_provisioned(conn: &rusqlite::Connection) {
-    let already_has_key = db::get_setting(conn, "vault_key_blob").is_some()
-        || db::get_setting(conn, "dpapi_vault_key_blob").is_some();
-    if already_has_key {
-        return;
-    }
-    let vk = VaultKey::random();
-    let Ok(dpapi_blob) = crate::dpapi::protect(vk.as_bytes()) else {
-        return;
-    };
-    let _ = db::set_setting(conn, "dpapi_vault_key_blob", &hex::encode(&dpapi_blob));
-}
-
-/// Attempt a silent DPAPI-based unlock. Called exactly once, synchronously,
-/// from `lib.rs::run()` before the Tauri builder runs — never wired to any
-/// command or event, so an explicit `lock_vault()` (tray or in-app) can never
-/// be silently undone; only a fresh process restart re-arms this. Any failure
-/// (auto-unlock disabled, wrong machine/user, corrupt blob) is swallowed and
-/// falls through to the normal password-unlock screen.
-pub fn try_auto_unlock(conn: &rusqlite::Connection, state: &VaultState) {
-    let Some(blob_hex) = db::get_setting(conn, "dpapi_vault_key_blob") else {
-        return;
-    };
-    let Ok(blob) = hex::decode(blob_hex) else {
-        return;
-    };
-    let Ok(vk_bytes) = crate::dpapi::unprotect(&blob) else {
-        return;
-    };
-    if vk_bytes.len() != VAULT_KEY_LEN {
-        return;
-    }
-    let mut arr = [0u8; VAULT_KEY_LEN];
-    arr.copy_from_slice(&vk_bytes);
-    state.unlock(VaultKey(arr));
 }
 
 // ── Autostart (Windows only; opt-in) ─────────────────────────────────────────
@@ -488,145 +421,6 @@ pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// ── Change master password ────────────────────────────────────────────────────
-
-#[tauri::command]
-pub fn change_master_password(
-    current: String,
-    new_password: String,
-    state: State<'_, Arc<VaultState>>,
-) -> Result<(), String> {
-    if new_password.len() < 8 {
-        return Err("New password must be at least 8 characters".to_string());
-    }
-    let conn = db::open().map_err(|e| e.to_string())?;
-    let salt_hex = db::get_setting(&conn, "master_salt").ok_or("Vault is not initialized")?;
-    let blob_hex = db::get_setting(&conn, "vault_key_blob").ok_or("Vault is not initialized")?;
-    let salt = hex::decode(salt_hex).map_err(|_| "Corrupt salt".to_string())?;
-    let blob = hex::decode(blob_hex).map_err(|_| "Corrupt vault key".to_string())?;
-    let current_dk = derive_key(&current, &salt)?;
-    let vk_bytes = crate::crypto::decrypt(&current_dk, &blob)
-        .map_err(|_| "Current password is incorrect".to_string())?;
-
-    let new_salt = random_bytes(SALT_LEN);
-    let new_dk = derive_key(&new_password, &new_salt)?;
-    let new_blob = crate::crypto::encrypt(&new_dk, &vk_bytes)?;
-    db::set_setting(&conn, "master_salt", &hex::encode(&new_salt))
-        .map_err(|e| e.to_string())?;
-    db::set_setting(&conn, "vault_key_blob", &hex::encode(&new_blob))
-        .map_err(|e| e.to_string())?;
-    // Quick PIN is invalidated when master password changes.
-    db::delete_setting(&conn, "quick_pin_salt").map_err(|e| e.to_string())?;
-    db::delete_setting(&conn, "quick_pin_blob").map_err(|e| e.to_string())?;
-
-    // Refresh in-memory key — it didn't change but make sure state is correct.
-    let mut arr = [0u8; VAULT_KEY_LEN];
-    arr.copy_from_slice(&vk_bytes);
-    state.unlock(VaultKey(arr));
-    Ok(())
-}
-
-// ── Legacy migration ──────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub fn migrate_legacy_vault(
-    old_pin: String,
-    new_password: String,
-    state: State<'_, Arc<VaultState>>,
-) -> Result<(), String> {
-    if new_password.len() < 8 {
-        return Err("New master password must be at least 8 characters".to_string());
-    }
-    let conn = db::open().map_err(|e| e.to_string())?;
-
-    // Verify old PIN against legacy SHA256 hash.
-    use sha2::Digest;
-    let old_hash = db::get_setting(&conn, "pin_hash").ok_or("Legacy vault not detected")?;
-    let computed: String = sha2::Sha256::digest(old_pin.as_bytes())
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
-    if computed != old_hash {
-        return Err("Incorrect legacy PIN".to_string());
-    }
-
-    // Set up new master password.
-    let salt = random_bytes(SALT_LEN);
-    let dk = derive_key(&new_password, &salt)?;
-    let vk = VaultKey::random();
-    let blob = crate::crypto::encrypt(&dk, vk.as_bytes())?;
-
-    // Re-encrypt every legacy credential into the new schema.
-    if db::has_legacy_vault(&conn) {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, project_id, title, username, secret, url, notes, category, \
-                       created_at, updated_at FROM credentials_legacy_v0",
-            )
-            .map_err(|e| e.to_string())?;
-        struct LegacyRow {
-            project_id: i64,
-            title: String,
-            username: String,
-            secret: String,
-            url: String,
-            notes: String,
-            category: String,
-            created_at: String,
-            updated_at: String,
-        }
-        let rows: Vec<LegacyRow> = stmt
-            .query_map([], |row| {
-                Ok(LegacyRow {
-                    project_id: row.get(1)?,
-                    title: row.get(2)?,
-                    username: row.get(3).unwrap_or_default(),
-                    secret: row.get(4).unwrap_or_default(),
-                    url: row.get(5).unwrap_or_default(),
-                    notes: row.get(6).unwrap_or_default(),
-                    category: row.get(7).unwrap_or_else(|_| "other".to_string()),
-                    created_at: row.get(8).unwrap_or_default(),
-                    updated_at: row.get(9).unwrap_or_default(),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-
-        for r in rows {
-            let secret_blob = encrypt_string(vk.as_bytes(), &r.secret)?;
-            let notes_blob = encrypt_string(vk.as_bytes(), &r.notes)?;
-            conn.execute(
-                "INSERT INTO credentials (project_id, title, username, secret_blob, url, \
-                                          notes_blob, category, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    r.project_id,
-                    r.title,
-                    r.username,
-                    secret_blob,
-                    r.url,
-                    notes_blob,
-                    r.category,
-                    r.created_at,
-                    r.updated_at,
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        conn.execute("DROP TABLE credentials_legacy_v0", [])
-            .map_err(|e| e.to_string())?;
-    }
-
-    db::set_setting(&conn, "master_salt", &hex::encode(&salt)).map_err(|e| e.to_string())?;
-    db::set_setting(&conn, "vault_key_blob", &hex::encode(&blob)).map_err(|e| e.to_string())?;
-    db::delete_setting(&conn, "pin_hash").map_err(|e| e.to_string())?;
-    state.unlock(vk);
-    clear_failed_attempts(&conn);
-    Ok(())
-}
-
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -640,7 +434,6 @@ pub fn get_settings() -> Result<AppSettings, String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30),
         mcp_token: db::get_setting(&conn, "mcp_token").unwrap_or_default(),
-        quick_pin_set: db::get_setting(&conn, "quick_pin_blob").is_some(),
     })
 }
 
@@ -676,10 +469,8 @@ pub fn rotate_mcp_token() -> Result<String, String> {
 
 #[tauri::command]
 pub fn list_projects(state: State<'_, Arc<VaultState>>) -> Result<Vec<Project>, String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     let mut stmt = conn
         .prepare("SELECT id, name, description, color, created_at FROM projects ORDER BY name")
         .map_err(|e| e.to_string())?;
@@ -707,10 +498,8 @@ pub fn create_project(
     color: String,
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Project, String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute(
         "INSERT INTO projects (name, description, color) VALUES (?1, ?2, ?3)",
         params![name, description, color],
@@ -742,10 +531,8 @@ pub fn update_project(
     color: String,
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Project, String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute(
         "UPDATE projects SET name=?1, description=?2, color=?3 WHERE id=?4",
         params![name, description, color, id],
@@ -770,10 +557,8 @@ pub fn update_project(
 
 #[tauri::command]
 pub fn delete_project(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute("DELETE FROM projects WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     state.touch();
@@ -788,20 +573,20 @@ pub fn list_credentials(
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Vec<Credential>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<Vec<Credential>, String> {
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {CRED_COLS} FROM credentials WHERE project_id=?1 \
-                 ORDER BY favorite DESC, title"
-            ))
-            .map_err(|e| e.to_string())?;
-        let creds = stmt
-            .query_map(params![project_id], |row| row_to_credential(row, vk))
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(creds)
-    })?
+    require_migrated(&conn)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CRED_COLS} FROM credentials WHERE project_id=?1 \
+             ORDER BY favorite DESC, title"
+        ))
+        .map_err(|e| e.to_string())?;
+    let creds = stmt
+        .query_map(params![project_id], row_to_credential)
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    state.touch();
+    Ok(creds)
 }
 
 #[tauri::command]
@@ -822,46 +607,32 @@ pub fn create_credential(
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Credential, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<Credential, String> {
-        let secret_blob = encrypt_string(vk.as_bytes(), &secret)?;
-        let notes_blob = encrypt_string(vk.as_bytes(), &notes)?;
-        let totp_blob = encrypt_string(vk.as_bytes(), &totp_secret)?;
-        let custom_json = if custom_fields.is_empty() {
-            String::new()
-        } else {
-            serde_json::to_string(&custom_fields).unwrap_or_default()
-        };
-        let custom_blob = encrypt_string(vk.as_bytes(), &custom_json)?;
-        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+    require_migrated(&conn)?;
+    let custom_json = if custom_fields.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&custom_fields).unwrap_or_default()
+    };
+    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
 
-        conn.execute(
-            "INSERT INTO credentials (project_id, title, username, secret_blob, url, notes_blob, \
-                                      category, tags, favorite, totp_blob, custom_blob, expiry_date)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
-                project_id,
-                title,
-                username,
-                secret_blob,
-                url,
-                notes_blob,
-                category,
-                tags_json,
-                if favorite { 1 } else { 0 },
-                totp_blob,
-                custom_blob,
-                expiry_date,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        let id = conn.last_insert_rowid();
-        conn.query_row(
-            &format!("SELECT {CRED_COLS} FROM credentials WHERE id=?1"),
-            params![id],
-            |row| row_to_credential(row, vk),
-        )
-        .map_err(|e| e.to_string())
-    })?
+    conn.execute(
+        "INSERT INTO credentials (project_id, title, username, secret, url, notes, \
+                                  category, tags, favorite, totp_secret, custom_fields, expiry_date)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![
+            project_id, title, username, secret, url, notes, category, tags_json,
+            if favorite { 1 } else { 0 }, totp_secret, custom_json, expiry_date,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = conn.last_insert_rowid();
+    state.touch();
+    conn.query_row(
+        &format!("SELECT {CRED_COLS} FROM credentials WHERE id=?1"),
+        params![id],
+        row_to_credential,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -882,54 +653,38 @@ pub fn update_credential(
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Credential, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<Credential, String> {
-        let secret_blob = encrypt_string(vk.as_bytes(), &secret)?;
-        let notes_blob = encrypt_string(vk.as_bytes(), &notes)?;
-        let totp_blob = encrypt_string(vk.as_bytes(), &totp_secret)?;
-        let custom_json = if custom_fields.is_empty() {
-            String::new()
-        } else {
-            serde_json::to_string(&custom_fields).unwrap_or_default()
-        };
-        let custom_blob = encrypt_string(vk.as_bytes(), &custom_json)?;
-        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+    require_migrated(&conn)?;
+    let custom_json = if custom_fields.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&custom_fields).unwrap_or_default()
+    };
+    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
 
-        conn.execute(
-            "UPDATE credentials SET title=?1, username=?2, secret_blob=?3, url=?4, \
-                                    notes_blob=?5, category=?6, tags=?7, favorite=?8, \
-                                    totp_blob=?9, custom_blob=?10, expiry_date=?11, \
-                                    updated_at=datetime('now') WHERE id=?12",
-            params![
-                title,
-                username,
-                secret_blob,
-                url,
-                notes_blob,
-                category,
-                tags_json,
-                if favorite { 1 } else { 0 },
-                totp_blob,
-                custom_blob,
-                expiry_date,
-                id,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.query_row(
-            &format!("SELECT {CRED_COLS} FROM credentials WHERE id=?1"),
-            params![id],
-            |row| row_to_credential(row, vk),
-        )
-        .map_err(|e| e.to_string())
-    })?
+    conn.execute(
+        "UPDATE credentials SET title=?1, username=?2, secret=?3, url=?4, \
+                                notes=?5, category=?6, tags=?7, favorite=?8, \
+                                totp_secret=?9, custom_fields=?10, expiry_date=?11, \
+                                updated_at=datetime('now') WHERE id=?12",
+        params![
+            title, username, secret, url, notes, category, tags_json,
+            if favorite { 1 } else { 0 }, totp_secret, custom_json, expiry_date, id,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    state.touch();
+    conn.query_row(
+        &format!("SELECT {CRED_COLS} FROM credentials WHERE id=?1"),
+        params![id],
+        row_to_credential,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete_credential(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute("DELETE FROM credentials WHERE id=?1", params![id])
         .map_err(|e| e.to_string())?;
     state.touch();
@@ -938,24 +693,21 @@ pub fn delete_credential(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(
 
 #[tauri::command]
 pub fn touch_credential_used(id: i64, state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute(
         "UPDATE credentials SET last_used_at=datetime('now') WHERE id=?1",
         params![id],
     )
     .map_err(|e| e.to_string())?;
+    state.touch();
     Ok(())
 }
 
 #[tauri::command]
 pub fn toggle_favorite(id: i64, state: State<'_, Arc<VaultState>>) -> Result<bool, String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute(
         "UPDATE credentials SET favorite = 1 - favorite WHERE id=?1",
         params![id],
@@ -977,40 +729,40 @@ pub fn list_all_credentials(
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Vec<CredentialWithProject>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<Vec<CredentialWithProject>, String> {
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {CRED_COLS_JOIN}, p.name as project_name FROM credentials c \
-                 JOIN projects p ON c.project_id=p.id ORDER BY p.name, c.title"
-            ))
-            .map_err(|e| e.to_string())?;
-        let results = stmt
-            .query_map([], |row| {
-                let cred = row_to_credential(row, vk)?;
-                let project_name: String = row.get(16)?;
-                Ok(CredentialWithProject {
-                    id: cred.id,
-                    project_id: cred.project_id,
-                    project_name,
-                    title: cred.title,
-                    username: cred.username,
-                    secret: cred.secret,
-                    url: cred.url,
-                    notes: cred.notes,
-                    category: cred.category,
-                    tags: cred.tags,
-                    favorite: cred.favorite,
-                    totp_secret: cred.totp_secret,
-                    custom_fields: cred.custom_fields,
-                    expiry_date: cred.expiry_date,
-                    last_used_at: cred.last_used_at,
-                })
+    require_migrated(&conn)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CRED_COLS_JOIN}, p.name as project_name FROM credentials c \
+             JOIN projects p ON c.project_id=p.id ORDER BY p.name, c.title"
+        ))
+        .map_err(|e| e.to_string())?;
+    let results = stmt
+        .query_map([], |row| {
+            let cred = row_to_credential(row)?;
+            let project_name: String = row.get(16)?;
+            Ok(CredentialWithProject {
+                id: cred.id,
+                project_id: cred.project_id,
+                project_name,
+                title: cred.title,
+                username: cred.username,
+                secret: cred.secret,
+                url: cred.url,
+                notes: cred.notes,
+                category: cred.category,
+                tags: cred.tags,
+                favorite: cred.favorite,
+                totp_secret: cred.totp_secret,
+                custom_fields: cred.custom_fields,
+                expiry_date: cred.expiry_date,
+                last_used_at: cred.last_used_at,
             })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(results)
-    })?
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    state.touch();
+    Ok(results)
 }
 
 #[tauri::command]
@@ -1019,57 +771,55 @@ pub fn search_credentials(
     state: State<'_, Arc<VaultState>>,
 ) -> Result<Vec<CredentialWithProject>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     let pattern = format!("%{}%", query);
-    state.with_key(|vk| -> Result<Vec<CredentialWithProject>, String> {
-        // Two-stage search: SQL LIKE on plaintext columns (title, username, url),
-        // plus a post-decrypt scan over notes/secret/custom fields.
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {CRED_COLS_JOIN}, p.name as project_name FROM credentials c \
-                 JOIN projects p ON c.project_id=p.id ORDER BY p.name, c.title"
-            ))
-            .map_err(|e| e.to_string())?;
-        let q_lower = query.to_lowercase();
-        let p_lower = pattern.to_lowercase();
-        let results: Vec<CredentialWithProject> = stmt
-            .query_map([], |row| {
-                let cred = row_to_credential(row, vk)?;
-                let project_name: String = row.get(16)?;
-                Ok(CredentialWithProject {
-                    id: cred.id,
-                    project_id: cred.project_id,
-                    project_name,
-                    title: cred.title,
-                    username: cred.username,
-                    secret: cred.secret,
-                    url: cred.url,
-                    notes: cred.notes,
-                    category: cred.category,
-                    tags: cred.tags,
-                    favorite: cred.favorite,
-                    totp_secret: cred.totp_secret,
-                    custom_fields: cred.custom_fields,
-                    expiry_date: cred.expiry_date,
-                    last_used_at: cred.last_used_at,
-                })
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CRED_COLS_JOIN}, p.name as project_name FROM credentials c \
+             JOIN projects p ON c.project_id=p.id ORDER BY p.name, c.title"
+        ))
+        .map_err(|e| e.to_string())?;
+    let q_lower = query.to_lowercase();
+    let p_lower = pattern.to_lowercase();
+    let results: Vec<CredentialWithProject> = stmt
+        .query_map([], |row| {
+            let cred = row_to_credential(row)?;
+            let project_name: String = row.get(16)?;
+            Ok(CredentialWithProject {
+                id: cred.id,
+                project_id: cred.project_id,
+                project_name,
+                title: cred.title,
+                username: cred.username,
+                secret: cred.secret,
+                url: cred.url,
+                notes: cred.notes,
+                category: cred.category,
+                tags: cred.tags,
+                favorite: cred.favorite,
+                totp_secret: cred.totp_secret,
+                custom_fields: cred.custom_fields,
+                expiry_date: cred.expiry_date,
+                last_used_at: cred.last_used_at,
             })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .filter(|c| {
-                let hay = format!(
-                    "{} {} {} {} {} {}",
-                    c.title.to_lowercase(),
-                    c.username.to_lowercase(),
-                    c.url.to_lowercase(),
-                    c.notes.to_lowercase(),
-                    c.tags.join(" ").to_lowercase(),
-                    c.category.to_lowercase(),
-                );
-                hay.contains(&q_lower) || hay.contains(&p_lower.replace('%', ""))
-            })
-            .collect();
-        Ok(results)
-    })?
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .filter(|c| {
+            let hay = format!(
+                "{} {} {} {} {} {}",
+                c.title.to_lowercase(),
+                c.username.to_lowercase(),
+                c.url.to_lowercase(),
+                c.notes.to_lowercase(),
+                c.tags.join(" ").to_lowercase(),
+                c.category.to_lowercase(),
+            );
+            hay.contains(&q_lower) || hay.contains(&p_lower.replace('%', ""))
+        })
+        .collect();
+    state.touch();
+    Ok(results)
 }
 
 // ── TOTP ──────────────────────────────────────────────────────────────────────
@@ -1086,24 +836,23 @@ pub fn totp_for_credential(
     state: State<'_, Arc<VaultState>>,
 ) -> Result<TotpResult, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<TotpResult, String> {
-        let totp_blob: String = conn
-            .query_row(
-                "SELECT totp_blob FROM credentials WHERE id=?1",
-                params![credential_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        let secret = decrypt_string(vk.as_bytes(), &totp_blob)?;
-        if secret.is_empty() {
-            return Err("No TOTP secret configured".to_string());
-        }
-        let (code, remaining) = totp_code(&secret, 30, 6)?;
-        Ok(TotpResult {
-            code,
-            remaining_seconds: remaining,
-        })
-    })?
+    require_migrated(&conn)?;
+    let secret: String = conn
+        .query_row(
+            "SELECT totp_secret FROM credentials WHERE id=?1",
+            params![credential_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if secret.is_empty() {
+        return Err("No TOTP secret configured".to_string());
+    }
+    state.touch();
+    let (code, remaining) = totp_code(&secret, 30, 6)?;
+    Ok(TotpResult {
+        code,
+        remaining_seconds: remaining,
+    })
 }
 
 // ── Password generator ────────────────────────────────────────────────────────
@@ -1160,6 +909,10 @@ pub fn generate_password(opts: GenPwOptions) -> Result<String, String> {
 }
 
 // ── Backup / restore ──────────────────────────────────────────────────────────
+//
+// Backups stay password-protected even though at-rest storage no longer is —
+// a portable backup file is far more likely to be casually emailed/uploaded
+// than the live local DB, so this remains real AES-256-GCM encryption.
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BackupHeader {
@@ -1191,25 +944,24 @@ pub fn export_backup(
         return Err("Backup password must be at least 8 characters".to_string());
     }
     let conn = db::open().map_err(|e| e.to_string())?;
-    let projects: Vec<Project> = state.with_key(|_vk| -> Result<Vec<Project>, String> {
-        let mut stmt = conn
-            .prepare("SELECT id, name, description, color, created_at FROM projects ORDER BY id")
-            .map_err(|e| e.to_string())?;
-        let rows: Vec<Project> = stmt
-            .query_map([], |row| {
-                Ok(Project {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2).unwrap_or_default(),
-                    color: row.get(3).unwrap_or_else(|_| "indigo".to_string()),
-                    created_at: row.get(4).unwrap_or_default(),
-                })
+    require_migrated(&conn)?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, description, color, created_at FROM projects ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let projects: Vec<Project> = stmt
+        .query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2).unwrap_or_default(),
+                color: row.get(3).unwrap_or_else(|_| "indigo".to_string()),
+                created_at: row.get(4).unwrap_or_default(),
             })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
-    })??;
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
     let credentials = list_all_credentials(state)?;
 
     let payload = BackupPayload {
@@ -1261,78 +1013,64 @@ pub fn import_backup(
         .map_err(|_| "Backup payload is malformed".to_string())?;
 
     let conn = db::open().map_err(|e| e.to_string())?;
-    state.with_key(|vk| -> Result<i64, String> {
-        if replace_existing {
-            conn.execute("DELETE FROM credentials", [])
-                .map_err(|e| e.to_string())?;
-            conn.execute("DELETE FROM projects", [])
-                .map_err(|e| e.to_string())?;
-        }
+    require_migrated(&conn)?;
+    if replace_existing {
+        conn.execute("DELETE FROM credentials", [])
+            .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM projects", [])
+            .map_err(|e| e.to_string())?;
+    }
 
-        let mut id_remap: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        for p in &payload.projects {
-            // Skip if a project with the same name already exists (when not replacing).
-            let existing: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM projects WHERE name=?1",
-                    params![p.name],
-                    |row| row.get(0),
-                )
-                .ok();
-            let new_id = if let Some(eid) = existing {
-                eid
-            } else {
-                conn.execute(
-                    "INSERT INTO projects (name, description, color, created_at) \
-                     VALUES (?1, ?2, ?3, COALESCE(?4, datetime('now')))",
-                    params![p.name, p.description, p.color, p.created_at],
-                )
-                .map_err(|e| e.to_string())?;
-                conn.last_insert_rowid()
-            };
-            id_remap.insert(p.id, new_id);
-        }
-
-        let mut imported: i64 = 0;
-        for c in &payload.credentials {
-            let target_pid = match id_remap.get(&c.project_id) {
-                Some(id) => *id,
-                None => continue,
-            };
-            let secret_blob = encrypt_string(vk.as_bytes(), &c.secret)?;
-            let notes_blob = encrypt_string(vk.as_bytes(), &c.notes)?;
-            let totp_blob = encrypt_string(vk.as_bytes(), &c.totp_secret)?;
-            let custom_json = if c.custom_fields.is_empty() {
-                String::new()
-            } else {
-                serde_json::to_string(&c.custom_fields).unwrap_or_default()
-            };
-            let custom_blob = encrypt_string(vk.as_bytes(), &custom_json)?;
-            let tags_json = serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".to_string());
+    let mut id_remap: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for p in &payload.projects {
+        // Skip if a project with the same name already exists (when not replacing).
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM projects WHERE name=?1",
+                params![p.name],
+                |row| row.get(0),
+            )
+            .ok();
+        let new_id = if let Some(eid) = existing {
+            eid
+        } else {
             conn.execute(
-                "INSERT INTO credentials (project_id, title, username, secret_blob, url, notes_blob, \
-                                          category, tags, favorite, totp_blob, custom_blob, expiry_date)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                params![
-                    target_pid,
-                    c.title,
-                    c.username,
-                    secret_blob,
-                    c.url,
-                    notes_blob,
-                    c.category,
-                    tags_json,
-                    if c.favorite { 1 } else { 0 },
-                    totp_blob,
-                    custom_blob,
-                    c.expiry_date,
-                ],
+                "INSERT INTO projects (name, description, color, created_at) \
+                 VALUES (?1, ?2, ?3, COALESCE(?4, datetime('now')))",
+                params![p.name, p.description, p.color, p.created_at],
             )
             .map_err(|e| e.to_string())?;
-            imported += 1;
-        }
-        Ok(imported)
-    })?
+            conn.last_insert_rowid()
+        };
+        id_remap.insert(p.id, new_id);
+    }
+
+    let mut imported: i64 = 0;
+    for c in &payload.credentials {
+        let target_pid = match id_remap.get(&c.project_id) {
+            Some(id) => *id,
+            None => continue,
+        };
+        let custom_json = if c.custom_fields.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(&c.custom_fields).unwrap_or_default()
+        };
+        let tags_json = serde_json::to_string(&c.tags).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "INSERT INTO credentials (project_id, title, username, secret, url, notes, \
+                                      category, tags, favorite, totp_secret, custom_fields, expiry_date)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                target_pid, c.title, c.username, c.secret, c.url, c.notes, c.category,
+                tags_json, if c.favorite { 1 } else { 0 }, c.totp_secret, custom_json, c.expiry_date,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        imported += 1;
+    }
+    state.touch();
+    Ok(imported)
 }
 
 // ── File system helpers ───────────────────────────────────────────────────────
@@ -1351,14 +1089,13 @@ pub fn read_text_file(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn delete_all_data(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
-    if !state.is_unlocked() {
-        return Err("Vault is locked".to_string());
-    }
     let conn = db::open().map_err(|e| e.to_string())?;
+    require_migrated(&conn)?;
     conn.execute("DELETE FROM credentials", [])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM projects", [])
         .map_err(|e| e.to_string())?;
+    state.touch();
     Ok(())
 }
 
