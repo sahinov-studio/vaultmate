@@ -12,11 +12,13 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "VaultMate",
         "width": 1100,
         "height": 720,
         "minWidth": 800,
-        "minHeight": 500
+        "minHeight": 500,
+        "visible": false
       }
     ],
     "security": {

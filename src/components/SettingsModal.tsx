@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { Eye, EyeOff, KeyRound, RefreshCw, Copy, Check, AlertTriangle } from "lucide-react";
+import { Eye, EyeOff, KeyRound, RefreshCw, Copy, Check, AlertTriangle, Power } from "lucide-react";
 import { useStore } from "../store";
 import { api } from "../lib/api";
 import { toast, asError } from "../lib/toast";
 import { Modal, Field, inputCls } from "./AppShellShared";
 
-type Tab = "general" | "security" | "mcp" | "danger";
+type Tab = "general" | "security" | "mcp" | "startup" | "danger";
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<Tab>("general");
@@ -15,11 +15,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <TabBtn id="general" active={tab} on={setTab}>General</TabBtn>
         <TabBtn id="security" active={tab} on={setTab}>Security</TabBtn>
         <TabBtn id="mcp" active={tab} on={setTab}>MCP</TabBtn>
+        <TabBtn id="startup" active={tab} on={setTab}>Startup</TabBtn>
         <TabBtn id="danger" active={tab} on={setTab}>Advanced</TabBtn>
       </div>
       {tab === "general" && <GeneralTab />}
       {tab === "security" && <SecurityTab />}
       {tab === "mcp" && <McpTab />}
+      {tab === "startup" && <StartupTab />}
       {tab === "danger" && <DangerTab />}
     </Modal>
   );
@@ -63,7 +65,7 @@ function GeneralTab() {
 
   const submit = async () => {
     try {
-      await save(autoLock, clipboard, settings?.mcp_enabled ?? true);
+      await save(autoLock, clipboard);
     } catch (e) {
       toast.error(asError(e));
     }
@@ -263,33 +265,14 @@ function SecurityTab() {
 // ── MCP ──────────────────────────────────────────────────────────────────────
 function McpTab() {
   const settings = useStore((s) => s.settings);
-  const save = useStore((s) => s.saveSettings);
   const loadSettings = useStore((s) => s.loadSettings);
-  const [enabled, setEnabled] = useState(settings?.mcp_enabled ?? true);
   const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (settings) setEnabled(settings.mcp_enabled);
-  }, [settings]);
 
   const rotate = async () => {
     try {
       await api.rotateMcpToken();
       await loadSettings();
       toast.success("MCP token rotated. Update your Claude Code config.");
-    } catch (e) {
-      toast.error(asError(e));
-    }
-  };
-
-  const toggle = async (next: boolean) => {
-    setEnabled(next);
-    try {
-      await save(
-        settings?.auto_lock_minutes ?? 5,
-        settings?.clipboard_clear_seconds ?? 30,
-        next,
-      );
     } catch (e) {
       toast.error(asError(e));
     }
@@ -305,25 +288,12 @@ function McpTab() {
   return (
     <div className="flex flex-col gap-4">
       <div>
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">MCP Server</h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Local-only HTTP server on port 43218 for Claude Code integration.
-            </p>
-          </div>
-          <label className="inline-flex items-center cursor-pointer">
-            <input
-              type="checkbox"
-              checked={enabled}
-              onChange={(e) => toggle(e.target.checked)}
-              className="sr-only peer"
-            />
-            <span className="relative h-5 w-10 rounded-full bg-slate-300 transition-colors peer-checked:bg-indigo-500 dark:bg-slate-600">
-              <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white transition-transform peer-checked:translate-x-5" />
-            </span>
-          </label>
-        </div>
+        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">MCP Server</h3>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Local-only HTTP server on port 43218 for Claude Code integration. Anyone with the
+          token below can connect — like a Supabase personal access token, the token itself
+          is the only thing that gates access.
+        </p>
       </div>
 
       <Field
@@ -358,6 +328,144 @@ function McpTab() {
 }`}
         </pre>
       </div>
+    </div>
+  );
+}
+
+// ── Startup ──────────────────────────────────────────────────────────────────
+function StartupTab() {
+  const [autostart, setAutostart] = useState(false);
+  const [autoUnlock, setAutoUnlock] = useState(false);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = async () => {
+    try {
+      const [as, au] = await Promise.all([
+        api.isAutostartEnabled(),
+        api.isAutoUnlockEnabled(),
+      ]);
+      setAutostart(as);
+      setAutoUnlock(au);
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const toggleAutostart = async (next: boolean) => {
+    try {
+      if (next) await api.enableAutostart();
+      else await api.disableAutostart();
+      setAutostart(next);
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  };
+
+  const enableAutoUnlock = async () => {
+    if (!password) return toast.error("Enter your master password");
+    setBusy(true);
+    try {
+      await api.enableAutoUnlock(password);
+      setPassword("");
+      setAutoUnlock(true);
+      toast.success("Auto-unlock enabled");
+    } catch (e) {
+      toast.error(asError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disableAutoUnlock = async () => {
+    try {
+      await api.disableAutoUnlock();
+      setAutoUnlock(false);
+      toast.success("Auto-unlock disabled");
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-6">
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-start gap-2">
+            <Power className="h-4 w-4 mt-1 text-slate-400" />
+            <div>
+              <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Start at login</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Launch VaultMate in the background (system tray) when you log into Windows.
+              </p>
+            </div>
+          </div>
+          <label className="inline-flex items-center cursor-pointer">
+            <input
+              type="checkbox"
+              checked={autostart}
+              onChange={(e) => toggleAutostart(e.target.checked)}
+              className="sr-only peer"
+            />
+            <span className="relative h-5 w-10 rounded-full bg-slate-300 transition-colors peer-checked:bg-indigo-500 dark:bg-slate-600">
+              <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white transition-transform peer-checked:translate-x-5" />
+            </span>
+          </label>
+        </div>
+      </section>
+
+      <section className="space-y-3 border-t border-slate-200 pt-5 dark:border-slate-700/50">
+        <div className="flex items-start gap-2">
+          <KeyRound className="h-4 w-4 mt-1 text-slate-400" />
+          <div>
+            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Auto-unlock</h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Unlock automatically at startup using Windows' own credential protection (DPAPI),
+              instead of typing your master password every time.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-amber-500" />
+          <p className="text-xs text-amber-700 dark:text-amber-400">
+            Anyone signed into this Windows account can unlock this vault without your master
+            password. Only enable this on a machine only you use.
+          </p>
+        </div>
+
+        {autoUnlock ? (
+          <button
+            onClick={disableAutoUnlock}
+            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm text-red-600 hover:bg-red-500/20 dark:text-red-400"
+          >
+            Disable auto-unlock
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <Field label="Confirm master password">
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className={inputCls}
+              />
+            </Field>
+            <button
+              onClick={enableAutoUnlock}
+              disabled={busy || !password}
+              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-40"
+            >
+              Enable auto-unlock
+            </button>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

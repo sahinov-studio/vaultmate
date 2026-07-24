@@ -47,7 +47,6 @@ export interface VaultStatus {
 export interface AppSettings {
   auto_lock_minutes: number;
   clipboard_clear_seconds: number;
-  mcp_enabled: boolean;
   mcp_token: string;
   quick_pin_set: boolean;
 }

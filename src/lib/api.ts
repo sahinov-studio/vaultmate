@@ -42,17 +42,23 @@ export const api = {
   enableQuickPin: (pin: string) => invoke<void>("enable_quick_pin", { pin }),
   disableQuickPin: () => invoke<void>("disable_quick_pin"),
 
+  // ── Auto-unlock (DPAPI) + autostart ────────────────────────────────
+  enableAutoUnlock: (password: string) =>
+    invoke<void>("enable_auto_unlock", { password }),
+  disableAutoUnlock: () => invoke<void>("disable_auto_unlock"),
+  isAutoUnlockEnabled: () => invoke<boolean>("is_auto_unlock_enabled"),
+  enableAutostart: () => invoke<void>("enable_autostart"),
+  disableAutostart: () => invoke<void>("disable_autostart"),
+  isAutostartEnabled: () => invoke<boolean>("is_autostart_enabled"),
+  wasLaunchedHidden: () => invoke<boolean>("was_launched_hidden"),
+  showMainWindow: () => invoke<void>("show_main_window"),
+
   // ── Settings ───────────────────────────────────────────────────────
   getSettings: () => invoke<AppSettings>("get_settings"),
-  updateSettings: (
-    autoLockMinutes: number,
-    clipboardClearSeconds: number,
-    mcpEnabled: boolean,
-  ) =>
+  updateSettings: (autoLockMinutes: number, clipboardClearSeconds: number) =>
     invoke<void>("update_settings", {
       autoLockMinutes,
       clipboardClearSeconds,
-      mcpEnabled,
     }),
   rotateMcpToken: () => invoke<string>("rotate_mcp_token"),
 

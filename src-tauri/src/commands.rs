@@ -94,7 +94,6 @@ pub struct VaultStatus {
 pub struct AppSettings {
     pub auto_lock_minutes: i64,
     pub clipboard_clear_seconds: i64,
-    pub mcp_enabled: bool,
     pub mcp_token: String,
     pub quick_pin_set: bool,
 }
@@ -191,7 +190,11 @@ fn clear_failed_attempts(conn: &rusqlite::Connection) {
 #[tauri::command]
 pub fn vault_status(state: State<'_, Arc<VaultState>>) -> Result<VaultStatus, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
-    let initialized = db::get_setting(&conn, "vault_key_blob").is_some();
+    // A PAT-style, DPAPI-only vault (auto-provisioned, no master password
+    // ever set) is just as "initialized" as a password-protected one — it
+    // must not fall through to the master-password setup screen.
+    let initialized = db::get_setting(&conn, "vault_key_blob").is_some()
+        || db::get_setting(&conn, "dpapi_vault_key_blob").is_some();
     let legacy = db::has_legacy_vault(&conn) || db::get_setting(&conn, "pin_hash").is_some();
     let locked_until: i64 = db::get_setting(&conn, "locked_until_ms")
         .and_then(|s| s.parse().ok())
@@ -331,6 +334,157 @@ pub fn disable_quick_pin() -> Result<(), String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     db::delete_setting(&conn, "quick_pin_salt").map_err(|e| e.to_string())?;
     db::delete_setting(&conn, "quick_pin_blob").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── DPAPI auto-unlock (Windows only; default, not opt-in) ────────────────────
+//
+// PAT-style access model: the MCP bearer token is the only credential a
+// client needs, forever, same as a Supabase personal access token — no
+// master password screen, no Settings toggle. Data is still DPAPI-encrypted
+// at rest (a copied-off `vaultmate.db` is useless without this exact Windows
+// user's DPAPI master key), but there is no human-facing unlock gate at all.
+//
+// `enable_auto_unlock` (password-based, kept for anyone migrating a vault
+// that still has an explicit master password from before this model existed)
+// wraps the raw VK with DPAPI. Deliberately re-verifies the password fresh
+// here rather than trusting session state, in case it's ever called from a
+// context that isn't already gated on being unlocked.
+
+#[tauri::command]
+pub fn enable_auto_unlock(password: String, _state: State<'_, Arc<VaultState>>) -> Result<(), String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let salt_hex = db::get_setting(&conn, "master_salt").ok_or("Vault is not initialized")?;
+    let blob_hex = db::get_setting(&conn, "vault_key_blob").ok_or("Vault is not initialized")?;
+    let salt = hex::decode(salt_hex).map_err(|_| "Corrupt salt".to_string())?;
+    let blob = hex::decode(blob_hex).map_err(|_| "Corrupt vault key".to_string())?;
+    let dk = derive_key(&password, &salt)?;
+
+    let vk_bytes = crate::crypto::decrypt(&dk, &blob).map_err(|_| "Incorrect master password".to_string())?;
+    if vk_bytes.len() != VAULT_KEY_LEN {
+        return Err("Corrupt vault key".to_string());
+    }
+    let dpapi_blob = crate::dpapi::protect(&vk_bytes)?;
+    db::set_setting(&conn, "dpapi_vault_key_blob", &hex::encode(&dpapi_blob))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn disable_auto_unlock(state: State<'_, Arc<VaultState>>) -> Result<(), String> {
+    if !state.is_unlocked() {
+        return Err("Vault is locked".to_string());
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    db::delete_setting(&conn, "dpapi_vault_key_blob").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn is_auto_unlock_enabled() -> Result<bool, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    Ok(db::get_setting(&conn, "dpapi_vault_key_blob").is_some())
+}
+
+/// Wraps the currently-unlocked session's VK with DPAPI, without needing the
+/// master password at all — safe because reaching this requires the vault to
+/// already be unlocked (enforced by the MCP server's own gate, or by the
+/// caller). This is how an existing password-protected vault migrates to the
+/// zero-friction PAT-style model with no further password entry, ever.
+pub fn enable_auto_unlock_from_session(
+    conn: &rusqlite::Connection,
+    state: &VaultState,
+) -> Result<(), String> {
+    state.with_key(|vk| {
+        let dpapi_blob = crate::dpapi::protect(vk.as_bytes())?;
+        db::set_setting(conn, "dpapi_vault_key_blob", &hex::encode(&dpapi_blob))
+            .map_err(|e| e.to_string())
+    })?
+}
+
+/// Called once, unconditionally, at every process start (`lib.rs::run()`,
+/// before `try_auto_unlock`). If this is a brand-new install with no vault at
+/// all, generates a random VK and DPAPI-wraps it immediately — no master
+/// password is ever created or asked for. This is what makes a fresh
+/// VaultMate install usable the instant it's launched: generate an MCP
+/// token, share it, and every read/add/update/delete just works from then on.
+pub fn ensure_vault_provisioned(conn: &rusqlite::Connection) {
+    let already_has_key = db::get_setting(conn, "vault_key_blob").is_some()
+        || db::get_setting(conn, "dpapi_vault_key_blob").is_some();
+    if already_has_key {
+        return;
+    }
+    let vk = VaultKey::random();
+    let Ok(dpapi_blob) = crate::dpapi::protect(vk.as_bytes()) else {
+        return;
+    };
+    let _ = db::set_setting(conn, "dpapi_vault_key_blob", &hex::encode(&dpapi_blob));
+}
+
+/// Attempt a silent DPAPI-based unlock. Called exactly once, synchronously,
+/// from `lib.rs::run()` before the Tauri builder runs — never wired to any
+/// command or event, so an explicit `lock_vault()` (tray or in-app) can never
+/// be silently undone; only a fresh process restart re-arms this. Any failure
+/// (auto-unlock disabled, wrong machine/user, corrupt blob) is swallowed and
+/// falls through to the normal password-unlock screen.
+pub fn try_auto_unlock(conn: &rusqlite::Connection, state: &VaultState) {
+    let Some(blob_hex) = db::get_setting(conn, "dpapi_vault_key_blob") else {
+        return;
+    };
+    let Ok(blob) = hex::decode(blob_hex) else {
+        return;
+    };
+    let Ok(vk_bytes) = crate::dpapi::unprotect(&blob) else {
+        return;
+    };
+    if vk_bytes.len() != VAULT_KEY_LEN {
+        return;
+    }
+    let mut arr = [0u8; VAULT_KEY_LEN];
+    arr.copy_from_slice(&vk_bytes);
+    state.unlock(VaultKey(arr));
+}
+
+// ── Autostart (Windows only; opt-in) ─────────────────────────────────────────
+
+#[tauri::command]
+pub fn enable_autostart(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().enable().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn disable_autostart(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().disable().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn is_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+// ── Window visibility ─────────────────────────────────────────────────────────
+//
+// The main window starts hidden (`visible: false` in tauri.conf.json) so an
+// autostart launch never flashes on screen. Showing it from Rust `.setup()`
+// is unreliable on Windows — the async WebView2 attachment that happens
+// after `.setup()` returns can silently re-hide it. So the frontend shows it
+// itself, once actually mounted, unless this was the `--hidden` launch that
+// the autostart plugin injects.
+
+#[tauri::command]
+pub fn was_launched_hidden() -> bool {
+    std::env::args().any(|a| a == "--hidden")
+}
+
+#[tauri::command]
+pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let window = app.get_webview_window("main").ok_or("Main window not found")?;
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -485,9 +639,6 @@ pub fn get_settings() -> Result<AppSettings, String> {
         clipboard_clear_seconds: db::get_setting(&conn, "clipboard_clear_seconds")
             .and_then(|s| s.parse().ok())
             .unwrap_or(30),
-        mcp_enabled: db::get_setting(&conn, "mcp_enabled")
-            .map(|s| s == "true")
-            .unwrap_or(true),
         mcp_token: db::get_setting(&conn, "mcp_token").unwrap_or_default(),
         quick_pin_set: db::get_setting(&conn, "quick_pin_blob").is_some(),
     })
@@ -497,7 +648,6 @@ pub fn get_settings() -> Result<AppSettings, String> {
 pub fn update_settings(
     auto_lock_minutes: i64,
     clipboard_clear_seconds: i64,
-    mcp_enabled: bool,
 ) -> Result<(), String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     db::set_setting(&conn, "auto_lock_minutes", &auto_lock_minutes.max(1).to_string())
@@ -508,8 +658,6 @@ pub fn update_settings(
         &clipboard_clear_seconds.max(5).to_string(),
     )
     .map_err(|e| e.to_string())?;
-    db::set_setting(&conn, "mcp_enabled", if mcp_enabled { "true" } else { "false" })
-        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

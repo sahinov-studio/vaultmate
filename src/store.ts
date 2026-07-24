@@ -41,11 +41,7 @@ interface Store {
 
   settings: AppSettings | null;
   loadSettings: () => Promise<void>;
-  saveSettings: (
-    autoLockMinutes: number,
-    clipboardClearSeconds: number,
-    mcpEnabled: boolean,
-  ) => Promise<void>;
+  saveSettings: (autoLockMinutes: number, clipboardClearSeconds: number) => Promise<void>;
 
   viewMode: ViewMode;
   setViewMode: (mode: ViewMode) => void;
@@ -162,8 +158,8 @@ export const useStore = create<Store>((set, get) => ({
       console.warn("Failed to load settings:", e);
     }
   },
-  saveSettings: async (autoLockMinutes, clipboardClearSeconds, mcpEnabled) => {
-    await api.updateSettings(autoLockMinutes, clipboardClearSeconds, mcpEnabled);
+  saveSettings: async (autoLockMinutes, clipboardClearSeconds) => {
+    await api.updateSettings(autoLockMinutes, clipboardClearSeconds);
     await get().loadSettings();
     toast.success("Settings saved");
   },

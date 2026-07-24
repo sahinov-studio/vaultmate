@@ -1,15 +1,50 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
+use tauri::Emitter;
 
 use crate::crypto::{decrypt_string, encrypt_string};
 use crate::db;
 use crate::state::VaultState;
 
 const MCP_PORT: u16 = 43218;
+
+/// The event name the frontend listens for to know its cached project /
+/// credential lists are stale and need reloading from disk.
+pub const DATA_CHANGED_EVENT: &str = "vaultmate://data-changed";
+
+/// Set once, from `lib.rs`'s `.setup()`, once the Tauri app (and therefore an
+/// `AppHandle`) actually exists. The MCP TCP listener itself starts earlier
+/// than that (before `.setup()` runs) so it can serve requests as soon as
+/// possible after boot — this lets it notify the frontend once that handle
+/// becomes available, without delaying server startup to wait for it.
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub fn set_app_handle(handle: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(handle);
+}
+
+/// Writes made via MCP happen on a raw `rusqlite` connection, entirely
+/// outside the app's own Tauri commands — so the already-mounted frontend's
+/// in-memory project/credential lists never hear about them on their own.
+/// Call this after any tool that mutates data so the UI can refresh itself.
+fn notify_data_changed() {
+    if let Some(handle) = APP_HANDLE.get() {
+        let _ = handle.emit(DATA_CHANGED_EVENT, ());
+    }
+}
+
+const MUTATING_TOOLS: &[&str] = &[
+    "create_project",
+    "update_project",
+    "delete_project",
+    "create_credential",
+    "update_credential",
+    "delete_credential",
+];
 
 pub fn start_mcp_server(state: Arc<VaultState>) {
     std::thread::spawn(move || {
@@ -56,15 +91,7 @@ fn handle_connection(stream: &mut TcpStream, state: Arc<VaultState>) {
         }
     };
 
-    let mcp_enabled = db::get_setting(&conn, "mcp_enabled")
-        .map(|s| s == "true")
-        .unwrap_or(true);
-    if !mcp_enabled {
-        send_status(stream, 403, r#"{"error":"MCP server is disabled"}"#);
-        return;
-    }
-
-    // Bearer-token auth.
+    // Bearer-token auth — the token is the only gate, same as a Supabase PAT.
     let stored_token = db::get_setting(&conn, "mcp_token").unwrap_or_default();
     let auth = headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
     let provided = auth.strip_prefix("Bearer ").unwrap_or("");
@@ -214,10 +241,15 @@ fn handle_mcp_request(body: &str, state: &VaultState) -> String {
                 .cloned()
                 .unwrap_or(Value::Object(Default::default()));
             match call_tool(name, &args, state) {
-                Ok(text) => json_rpc_ok(
-                    id,
-                    serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
-                ),
+                Ok(text) => {
+                    if MUTATING_TOOLS.contains(&name) {
+                        notify_data_changed();
+                    }
+                    json_rpc_ok(
+                        id,
+                        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                    )
+                }
                 Err(e) => json_rpc_error(id, -32603, &e),
             }
         }
@@ -373,6 +405,11 @@ fn tool_list() -> Value {
                 },
                 "required": ["project_name", "title"]
             }
+        },
+        {
+            "name": "enable_auto_unlock",
+            "description": "One-time migration for a vault that still has an explicit master password: wraps the already-unlocked session's key with Windows DPAPI so the vault never needs a password again, on any future launch. No-op if already enabled. Takes no arguments — reaching this tool at all already proves the vault is unlocked.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }
     ])
 }
@@ -776,6 +813,14 @@ fn call_tool(name: &str, args: &Value, state: &VaultState) -> Result<String, Str
                     "Deleted credential '{title}' from project '{project_name}'."
                 ))
             }
+        }
+
+        "enable_auto_unlock" => {
+            if db::get_setting(&conn, "dpapi_vault_key_blob").is_some() {
+                return Ok("Auto-unlock is already enabled — nothing to do.".to_string());
+            }
+            crate::commands::enable_auto_unlock_from_session(&conn, state)?;
+            Ok("Auto-unlock enabled. This vault will never ask for its master password again on this machine.".to_string())
         }
 
         _ => Err(format!("Unknown tool: {name}")),
