@@ -46,3 +46,8 @@ send-sample-invoice.mjs
 # Test data
 *.vmbackup
 vaultmate-*.json
+
+# Claude Code local session state — worktrees are separate git checkouts,
+# never commit them into the main tree
+.claude/worktrees/
+.claude/scheduled_tasks.lock

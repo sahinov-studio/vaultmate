@@ -1,24 +1,25 @@
 # VaultMate
 
-A local-first, encrypted credentials manager for developers — built with Tauri (Rust + React) and ships with a built-in MCP server so Claude Code and other AI assistants can read your secrets without copy-paste.
+A local-first credentials manager for developers — built with Tauri (Rust + React) and ships with a built-in MCP server so Claude Code and other AI assistants can read, create, update, and delete your secrets directly, with zero copy-paste and zero unlock friction.
 
 > **Local-only.** Your data never leaves your machine. There is no cloud sync, no analytics, no telemetry.
+>
+> **No at-rest encryption.** This is a deliberate design choice, not an oversight — see [Security Model](#security-model) before you decide whether VaultMate fits your threat model.
 
 ---
 
 ## Features
 
-- **AES-256-GCM encryption at rest** — every secret is encrypted with a vault key derived from your master password via Argon2id (64 MiB / 3 passes)
-- **Master password + optional quick PIN** — full-strength password by default, with an opt-in numeric PIN for fast unlock
-- **Auto-lock on idle** — vault locks itself after configurable inactivity (default 5 min)
-- **Rate-limited unlock** — exponential backoff after 5 failed attempts, capped at 30 min
+- **Zero-friction MCP** — no unlock step, ever. VaultMate's MCP server is gated purely by a bearer token, same as a Supabase personal access token — as long as VaultMate is running, Claude Code can use it
+- **Optional local screen-lock PIN** — a UI privacy convenience (Settings → Security), not a security boundary; it never gates MCP access, and if you never set one the app never gates access at all
+- **Auto-lock the screen on idle** — if a PIN is set, the screen re-locks after configurable inactivity (default 5 min); meaningless/no-op if no PIN is set
 - **15 categories** — Login, API Key, Database, SSH Key, Token, Env Variable, Credit Card, Wi-Fi, Crypto Wallet, Software License, Server, Secure Note, Identity, Email Account, Other
 - **Rich credential fields** — title, username, secret, URL, notes, tags, favorite, expiry date, custom fields, TOTP/2FA secret
 - **TOTP code generation** — built-in 2FA code generator with 30-second countdown (RFC 6238)
 - **Password generator** — configurable length, character classes, ambiguity-avoidance
-- **Encrypted backup & restore** — export your entire vault to a single password-protected `.vmbackup` file
+- **Password-protected backup & restore** — export your entire vault to a single password-encrypted `.vmbackup` file (the export file itself is still real AES-256-GCM encryption, independent of the live database's plaintext storage)
 - **Excel import** — auto-detect credential columns from `.xlsx`/`.xls`/`.csv` files
-- **MCP server** — local HTTP server on port 43218 with bearer-token auth, lets Claude Code list, search, and retrieve credentials
+- **Full-CRUD MCP server** — local HTTP server on port 43218, bearer-token auth, lets Claude Code list, search, create, update, and delete both projects and credentials
 - **Dark / light themes** — toggle in the sidebar
 - **Cross-platform** — Windows, macOS, Linux
 
@@ -26,7 +27,7 @@ A local-first, encrypted credentials manager for developers — built with Tauri
 
 ## Install
 
-Pre-built installers are published on the [Releases page](https://github.com/bittuai/vaultmate/releases):
+Pre-built installers are published on the [Releases page](https://github.com/sahinov-studio/vaultmate/releases):
 
 - **Windows**: download `VaultMate_<version>_x64-setup.exe` or the `.msi` installer
 - **macOS**: download `VaultMate_<version>_x64.dmg` (Intel) or `VaultMate_<version>_aarch64.dmg` (Apple Silicon)
@@ -43,25 +44,24 @@ Pre-built installers are published on the [Releases page](https://github.com/bit
 
 ## First Run
 
-1. Launch VaultMate.
-2. Create a master password (minimum 8 characters; the strength meter encourages mixed cases, digits, and symbols).
-3. **Write the master password down somewhere safe.** There is no recovery — losing it means losing every credential in the vault.
-4. (Optional) In Settings → Security, enable a quick PIN for faster unlocks during the day.
-5. Create your first project, then start adding credentials.
+1. Launch VaultMate — it opens straight to your projects. No setup step, no password to create.
+2. (Optional) In Settings → Security, set a local screen-lock PIN if you want a privacy gate on the window itself — purely a UI convenience, not encryption (see [Security Model](#security-model)).
+3. Create your first project, then start adding credentials.
+4. Want Claude Code to use it directly? See [Connect to Claude Code](#connect-to-claude-code) below.
 
 ---
 
 ## Backups (do this on day one)
 
-Sidebar → **Export Backup** writes every project and credential to an AES-256-GCM-encrypted JSON file. The backup uses a separate password — you can use the same as your master password or a different one.
+Sidebar → **Export Backup** writes every project and credential to an AES-256-GCM-encrypted JSON file, protected by a password you choose at export time.
 
-Without a backup, a corrupted database file or a forgotten master password means total data loss. **Take a backup before you trust the app with anything important.**
+Without a backup, a corrupted or deleted database file means total data loss — there's no server-side copy anywhere. **Take a backup before you trust the app with anything important.**
 
 ---
 
 ## MCP Server (Claude Code integration)
 
-VaultMate runs a local HTTP server on `127.0.0.1:43218` while it's open. Authentication uses a bearer token shown in **Settings → MCP**.
+VaultMate runs a local HTTP server on `127.0.0.1:43218` while it's open. Authentication uses a bearer token shown in **Settings → MCP** — that token is the *only* gate. There's no unlock step: as long as VaultMate is running, the MCP server works, regardless of whether the optional screen-lock PIN is currently locked.
 
 Add to your Claude Code MCP config:
 
@@ -78,18 +78,46 @@ Add to your Claude Code MCP config:
 }
 ```
 
-The MCP server only responds while VaultMate is **unlocked**. When you lock the vault, calls return `423 Locked`.
+(See [Connect to Claude Code](#connect-to-claude-code) below for a guided setup you can hand to Claude Code itself instead of doing this by hand.)
 
 Available tools:
 
 | Tool | Description |
 |------|-------------|
 | `list_projects` | List all projects |
-| `list_credentials` | List all credentials in a project (returns secrets in plaintext to the local MCP client) |
+| `list_credentials` | List all credentials in a project (returns secrets to the local MCP client) |
 | `get_credential` | Get one credential by project + title |
-| `search_credentials` | Substring search across title / username / URL |
+| `search_credentials` | Substring search across title / username / URL / notes / tags / category |
+| `create_project` | Create a new project |
+| `update_project` | Update a project's name, description, or color |
+| `delete_project` | Delete a project and all its credentials |
+| `create_credential` | Create a new credential (auto-creates the project if missing) |
+| `update_credential` | Partial update — only pass the fields that changed |
+| `delete_credential` | Delete a credential |
 
-Disable the MCP server in **Settings → MCP** if you don't use Claude Code.
+A `423` response means this vault still has old encrypted data from before at-rest encryption was removed (see [Security Model](#security-model)) — open VaultMate and complete the one-time migration screen. Otherwise, every call above works with zero prompts.
+
+---
+
+## Connect to Claude Code
+
+The fastest way to wire up the MCP integration is to hand it to Claude Code itself. This
+repo ships a [Claude Code skill](.claude/skills/connect-vaultmate.md) that walks through
+getting the token, registering the MCP server, and verifying it end to end.
+
+**Download just the skill file** and drop it into your personal skills folder:
+
+```bash
+curl -o ~/.claude/skills/connect-vaultmate.md \
+  https://raw.githubusercontent.com/sahinov-studio/vaultmate/main/.claude/skills/connect-vaultmate.md
+```
+
+Then, in Claude Code, just say **"connect vaultmate"** — it'll check VaultMate is
+running, ask you for the token from Settings → MCP, register it, and verify a real call
+works. Takes about a minute.
+
+(If you've cloned this repo instead of downloading the installer, the skill is already
+available project-locally — no separate download needed.)
 
 ---
 
@@ -102,7 +130,7 @@ You'll need:
 - Tauri 2 system dependencies — see the [Tauri prerequisites guide](https://tauri.app/start/prerequisites/)
 
 ```bash
-git clone https://github.com/bittuai/vaultmate
+git clone https://github.com/sahinov-studio/vaultmate
 cd vaultmate
 npm install
 npm run tauri dev    # development
@@ -113,30 +141,37 @@ npm run tauri build  # release installer in src-tauri/target/release/bundle
 
 ## Security Model
 
-### What's encrypted
+**VaultMate does not encrypt your data at rest.** As of the current version, there is no
+master password, no cryptographic vault key, and no at-rest encryption at all — every
+credential field is stored as plaintext in the local SQLite database. This was a
+deliberate design change (earlier versions did use AES-256-GCM + a master password; see
+[Upgrading](#upgrading-from-an-earlier-encrypted-version) below).
 
-- **Secret field, notes, TOTP secret, custom field values** — encrypted with AES-256-GCM using a 256-bit vault key, unique nonce per encryption
-- **Vault key** — encrypted with a key derived from your master password via Argon2id (m=64 MiB, t=3, p=4)
-- **Backup files** — encrypted with AES-256-GCM, key derived from a backup password you choose
+**Why:** VaultMate is built for a specific use case — a single developer's own machine,
+optimized for the lowest possible friction integrating with an AI coding assistant. A
+master-password unlock gate was the one thing standing between "just works" and "ask the
+user to unlock every session." If that trade-off doesn't match your situation — a shared
+machine, a machine you don't fully trust, a compliance requirement — **don't use
+VaultMate for anything sensitive**, or fork it and reintroduce encryption.
 
-### What's *not* encrypted (stored in plaintext)
+### What this means concretely
 
-- Project names, project descriptions, project colors
-- Credential titles, usernames, URLs, categories, tags, favorite flag, expiry date
+- Anyone with read access to your user account (or your `%APPDATA%\vaultmate\vaultmate.db` / equivalent file) can read every credential in plaintext. There is no password protecting the data itself.
+- The optional **screen-lock PIN** (Settings → Security) is a UI convenience — it hides the window's contents from someone glancing at your unattended screen. It is **not** a cryptographic gate, is trivial to bypass by anyone with filesystem access, and never affects MCP access.
+- **Backup files remain genuinely encrypted.** `.vmbackup` exports are still AES-256-GCM encrypted with a password you choose at export time — a portable file is a meaningfully different risk (easy to accidentally email/upload) than the live local database, so that layer was kept.
+- The MCP bearer token (Settings → MCP) is the only access control on the whole system. Anyone who can read that token and reach `127.0.0.1:43218` on your machine has full read/write access to your vault.
 
-The plaintext fields enable substring search without first decrypting every record. If your threat model requires title/URL secrecy, do not put sensitive identifiers in those fields.
+### What VaultMate still protects against
 
-### What VaultMate protects against
-
-- **Stolen laptop / DB file copy.** Without the master password, the vault key cannot be derived and AES-GCM ciphertext is computationally infeasible to recover.
-- **Local brute-force unlock.** Argon2id makes each guess take ~250 ms; failed attempts trigger exponential backoff capped at 30 minutes.
-- **Memory exposure on lock.** The vault key is wiped from memory (zeroized) when you lock the vault.
+- **Casual shoulder-surfing** — the optional screen-lock PIN hides the window.
+- **Remote network access** — the MCP server binds to `127.0.0.1` only; it is never reachable from another machine.
 
 ### What VaultMate does *not* protect against
 
-- **A keylogger or RAM scraper while you're unlocked** — no app can defend against that without OS-level help.
-- **A forgotten master password** — there is no recovery mechanism. This is the price of zero-knowledge encryption.
-- **Backups stored in the cloud without encryption** — VaultMate's `.vmbackup` files are encrypted, so storing them in Dropbox / iCloud / Google Drive is fine. Plain database file copies are *not* safe.
+- **Anyone with local file access to your machine or user account** — malware, another local user, a stolen unlocked laptop, backup software that syncs `%APPDATA%` unencrypted to the cloud.
+- **A keylogger or credential-stealing malware** — no local app can defend against that without OS-level help, but an unencrypted credential store is a materially easier target than an encrypted one.
+
+If you want the old encrypted model back, the code that implemented it (Argon2id + AES-256-GCM + master password) is in the git history prior to the security-model change — see the project's `CLAUDE.md` for the exact commit and rationale.
 
 ---
 
@@ -148,13 +183,27 @@ The plaintext fields enable substring search without first decrypting every reco
 | macOS    | `~/Library/Application Support/vaultmate/vaultmate.db` |
 | Linux    | `~/.config/vaultmate/vaultmate.db` |
 
-The database is a single SQLite file. Copy it elsewhere for off-machine backups (it is the encrypted form, so it's safe to put on cloud storage — though `.vmbackup` exports are preferred since they're versioned and labelled).
+The database is a single SQLite file, stored as **plaintext** (see [Security Model](#security-model)) — do not sync it unencrypted to cloud storage or a shared location. For off-machine backups, use **Export Backup** (`.vmbackup`), which is genuinely password-encrypted and safe to store anywhere.
 
 ---
 
-## Upgrading from v0.1.0
+## Upgrading from an Earlier (Encrypted) Version
 
-Versions prior to 1.0 stored secrets in plaintext SQLite. On first launch of v1.0+ you'll see an **Upgrade Vault** screen: enter your old 4-digit PIN, choose a new master password, and VaultMate re-encrypts every credential with the new format.
+If you're updating from a version that had a master password (the AES-256-GCM +
+Argon2id model described in earlier releases), first launch shows a one-time **"One
+last unlock"** screen — enter your current master password or quick PIN. VaultMate
+decrypts everything, flattens it to plaintext, and deletes the old password/key
+settings. You won't be asked for a password again after that, on this or any future
+launch.
+
+This also transparently absorbs the even older pre-1.0 plaintext-legacy format in the
+same step, if you somehow skipped straight from that version to this one.
+
+**Do this on a machine and account you trust** — after this step, anyone with access to
+this user account can read your credentials without any password at all (see
+[Security Model](#security-model)). If that's not acceptable, take an encrypted
+`.vmbackup` export *before* upgrading, using the old version, and don't upgrade this
+install.
 
 ---
 
@@ -177,4 +226,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-This is a small, focused project. Bug reports and PRs welcome at <https://github.com/bittuai/vaultmate>.
+This is a small, focused project. Bug reports and PRs welcome at <https://github.com/sahinov-studio/vaultmate>.
