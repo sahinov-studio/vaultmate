@@ -63,6 +63,20 @@ function AppRouter() {
 
   useAutoLock();
 
+  // Previously, every path into AppShell went through an explicit unlock
+  // action (unlock/unlockWithPin/setupMasterPassword) that loaded data as a
+  // side effect. A fully-migrated vault with no screen-lock PIN now renders
+  // AppShell directly on first mount with no such action — load here so
+  // that path isn't left with an empty in-memory project/credential list.
+  const ready = !!status && !status.needs_migration && !(status.pin_set && status.locked);
+  useEffect(() => {
+    if (ready) {
+      loadProjects();
+      loadAllCredentials();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
   if (!status) {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-100 dark:bg-slate-950">
