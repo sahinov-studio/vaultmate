@@ -398,8 +398,18 @@ pub fn idle_seconds(state: State<'_, Arc<VaultState>>) -> Result<i64, String> {
 
 #[tauri::command]
 pub fn enable_autostart(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_autostart::ManagerExt;
-    app.autolaunch().enable().map_err(|e| e.to_string())
+    // Bypass tauri-plugin-autostart's own enable(): its Windows backend
+    // (auto-launch crate) joins app_path and args with a bare space and never
+    // quotes app_path, so installs under a path with spaces (e.g. "Program
+    // Files") write a Run entry Windows can't parse back into an executable.
+    // Quote it ourselves before handing it to the same underlying crate.
+    let app_name = app.package_info().name.clone();
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let quoted_path = format!("\"{}\"", exe.display());
+
+    auto_launch::AutoLaunch::new(&app_name, &quoted_path, &["--hidden"])
+        .enable()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
