@@ -40,6 +40,7 @@ export interface VaultStatus {
   needs_migration: boolean;
   pin_set: boolean;
   locked: boolean;
+  onboarding_seen: boolean;
 }
 
 export interface AppSettings {

@@ -33,6 +33,8 @@ interface Store {
 
   status: VaultStatus | null;
   refreshStatus: () => Promise<void>;
+  completeOnboarding: () => Promise<void>;
+  replayOnboarding: () => Promise<void>;
   finishMigration: (secret: string, isPin: boolean) => Promise<void>;
   setPin: (pin: string) => Promise<void>;
   removePin: () => Promise<void>;
@@ -95,6 +97,16 @@ export const useStore = create<Store>((set, get) => ({
     } catch (e) {
       toast.error(asError(e));
     }
+  },
+
+  completeOnboarding: async () => {
+    await api.completeOnboarding();
+    await get().refreshStatus();
+  },
+
+  replayOnboarding: async () => {
+    await api.replayOnboarding();
+    await get().refreshStatus();
   },
 
   finishMigration: async (secret, isPin) => {

@@ -117,6 +117,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Auth / migration / screen lock
             commands::vault_status,
+            commands::complete_onboarding,
+            commands::replay_onboarding,
             commands::finish_migration,
             commands::set_pin,
             commands::remove_pin,
@@ -134,6 +136,7 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::rotate_mcp_token,
+            commands::install_claude_skill,
             // Projects
             commands::list_projects,
             commands::create_project,

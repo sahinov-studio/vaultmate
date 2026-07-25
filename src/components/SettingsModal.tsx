@@ -53,6 +53,7 @@ function TabBtn({
 function GeneralTab() {
   const settings = useStore((s) => s.settings);
   const save = useStore((s) => s.saveSettings);
+  const replayOnboarding = useStore((s) => s.replayOnboarding);
   const [autoLock, setAutoLock] = useState(settings?.auto_lock_minutes ?? 5);
   const [clipboard, setClipboard] = useState(settings?.clipboard_clear_seconds ?? 30);
 
@@ -66,6 +67,14 @@ function GeneralTab() {
   const submit = async () => {
     try {
       await save(autoLock, clipboard);
+    } catch (e) {
+      toast.error(asError(e));
+    }
+  };
+
+  const showIntro = async () => {
+    try {
+      await replayOnboarding();
     } catch (e) {
       toast.error(asError(e));
     }
@@ -105,6 +114,18 @@ function GeneralTab() {
       >
         Save
       </button>
+
+      <div className="flex items-center justify-between border-t border-slate-200 pt-4 dark:border-slate-700/50">
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Want to see the welcome tour again?
+        </p>
+        <button
+          onClick={showIntro}
+          className="text-xs font-medium text-indigo-600 hover:text-indigo-500 dark:text-indigo-400"
+        >
+          Replay onboarding
+        </button>
+      </div>
     </div>
   );
 }
@@ -221,6 +242,20 @@ function McpTab() {
     setTimeout(() => setCopied(false), 1500);
   };
 
+  const [installing, setInstalling] = useState(false);
+  const installSkill = async () => {
+    setInstalling(true);
+    try {
+      const path = await api.installClaudeSkill();
+      toast.success(`Skill installed — say "connect vaultmate" in Claude Code to finish setup.`);
+      console.info(`VaultMate skill written to ${path}`);
+    } catch (e) {
+      toast.error(asError(e));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4">
       <div>
@@ -263,6 +298,24 @@ function McpTab() {
   }
 }`}
         </pre>
+      </div>
+
+      <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 dark:bg-slate-900/40 dark:border-slate-700/50">
+        <p className="mb-1 text-xs font-semibold text-slate-700 dark:text-slate-300">
+          Claude Code skill
+        </p>
+        <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">
+          One click, no manual JSON editing, no internet needed — writes a guided setup
+          skill to <code className="rounded bg-slate-200/70 px-1 dark:bg-slate-700/60">~/.claude/skills/</code>.
+          Afterward just say <span className="italic">"connect vaultmate"</span> in Claude Code.
+        </p>
+        <button
+          onClick={installSkill}
+          disabled={installing}
+          className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm text-white hover:bg-indigo-500 disabled:opacity-40"
+        >
+          {installing ? "Installing..." : "Install Claude Code Skill"}
+        </button>
       </div>
     </div>
   );

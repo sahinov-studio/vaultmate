@@ -28,6 +28,8 @@ interface CredentialPayload {
 export const api = {
   // ── Auth / migration / screen lock ──────────────────────────────────
   vaultStatus: () => invoke<VaultStatus>("vault_status"),
+  completeOnboarding: () => invoke<void>("complete_onboarding"),
+  replayOnboarding: () => invoke<void>("replay_onboarding"),
   finishMigration: (secret: string, isPin: boolean) =>
     invoke<void>("finish_migration", { secret, isPin }),
   setPin: (pin: string) => invoke<void>("set_pin", { pin }),
@@ -52,6 +54,7 @@ export const api = {
       clipboardClearSeconds,
     }),
   rotateMcpToken: () => invoke<string>("rotate_mcp_token"),
+  installClaudeSkill: () => invoke<string>("install_claude_skill"),
 
   // ── Projects ───────────────────────────────────────────────────────
   listProjects: () => invoke<Project[]>("list_projects"),

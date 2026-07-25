@@ -89,6 +89,7 @@ pub struct VaultStatus {
     pub needs_migration: bool,
     pub pin_set: bool,
     pub locked: bool,
+    pub onboarding_seen: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -159,7 +160,22 @@ pub fn vault_status(state: State<'_, Arc<VaultState>>) -> Result<VaultStatus, St
         needs_migration: db::needs_migration(&conn),
         pin_set: db::get_setting(&conn, "screen_pin_hash").is_some(),
         locked: state.is_locked(),
+        onboarding_seen: db::get_setting(&conn, "onboarding_seen")
+            .map(|s| s == "true")
+            .unwrap_or(false),
     })
+}
+
+#[tauri::command]
+pub fn complete_onboarding() -> Result<(), String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "onboarding_seen", "true").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn replay_onboarding() -> Result<(), String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    db::set_setting(&conn, "onboarding_seen", "false").map_err(|e| e.to_string())
 }
 
 /// One-time flatten: recovers the vault key (from a master password, quick
@@ -463,6 +479,24 @@ pub fn rotate_mcp_token() -> Result<String, String> {
     let token = hex::encode(buf);
     db::set_setting(&conn, "mcp_token", &token).map_err(|e| e.to_string())?;
     Ok(token)
+}
+
+/// The Claude Code setup skill, baked into the binary at compile time so
+/// installing it never needs network/GitHub access — genuinely one click,
+/// offline, seamless. Source of truth is the repo's own copy; keep them in
+/// sync (this file IS that copy, just embedded).
+const CLAUDE_SKILL_MD: &str = include_str!("../../.claude/skills/connect-vaultmate.md");
+
+#[tauri::command]
+pub fn install_claude_skill() -> Result<String, String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map_err(|_| "Could not determine home directory".to_string())?;
+    let skills_dir = std::path::Path::new(&home).join(".claude").join("skills");
+    std::fs::create_dir_all(&skills_dir).map_err(|e| e.to_string())?;
+    let dest = skills_dir.join("connect-vaultmate.md");
+    std::fs::write(&dest, CLAUDE_SKILL_MD).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 // ── Projects ──────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ import { useStore } from "./store";
 import { api } from "./lib/api";
 import { FinalUnlockScreen } from "./components/FinalUnlockScreen";
 import { PinGate } from "./components/PinGate";
+import { OnboardingWizard } from "./components/OnboardingWizard";
 import { AppShell } from "./components/AppShell";
 import { Toaster } from "./components/Toaster";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -87,6 +88,7 @@ function AppRouter() {
 
   if (status.needs_migration) return <FinalUnlockScreen />;
   if (status.pin_set && status.locked) return <PinGate />;
+  if (!status.onboarding_seen) return <OnboardingWizard />;
   return <AppShell />;
 }
 
