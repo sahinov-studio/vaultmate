@@ -1,7 +1,7 @@
 {
   "name": "vaultmate",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "VaultMate — local-first encrypted credentials manager for developers.",
   "license": "MIT",
   "type": "module",
