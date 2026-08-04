@@ -34,6 +34,24 @@ Not a Supabase project — this predates and is independent of the global stack 
 
 ---
 
+## Docs Folder
+
+No `docs/` folder exists yet at repo root — `PRD.md` and `ROADMAP.md` (per the new global convention) have not been created for this project.
+
+---
+
+## Known Issues
+
+None currently tracked.
+
+---
+
+## Design Direction
+
+Utilitarian desktop UI, Tailwind-driven. Indigo (`#6366f1`) as the single accent color against a light/dark neutral scale (`slate`/`zinc`, e.g. `#f8fafc`/`#0f172a` light, `#020617`/`#f1f5f9` dark), toggled via an `html.dark` class rather than `prefers-color-scheme`. No custom illustration or brand system — this is an internal tool, not a marketing surface.
+
+---
+
 ## MCP Integration Notes
 - MCP server starts with the app process and needs VaultMate running (tray or foreground) to be reachable — "Start at login" (Settings → Startup) is opt-in, not defaulted on.
 - A vault created before 2026-07-24 needs a one-time interactive step (`FinalUnlockScreen`, entering the last master password/PIN) to flatten existing encrypted data to plaintext — gated by `vault_status.needs_migration`. Fresh installs skip this entirely.
